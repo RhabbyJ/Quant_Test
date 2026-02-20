@@ -1,0 +1,17 @@
+# Environment variables and Kalshi keys
+.env
+.env.local
+*.pem
+
+# Data warehouse
+data_warehouse/
+
+# Python caching
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env/

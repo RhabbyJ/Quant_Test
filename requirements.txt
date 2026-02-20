@@ -1,0 +1,9 @@
+duckdb
+pyarrow
+websockets
+streamlit
+pandas
+numpy
+requests
+cryptography
+python-dotenv
