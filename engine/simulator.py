@@ -3,6 +3,7 @@ import time
 import logging
 import uuid
 import re
+from collections import defaultdict, deque
 from typing import Any, Dict, List
 from dataclasses import dataclass
 
@@ -53,6 +54,9 @@ class EngineLoop:
         self.is_running = False
         self.ticker_close_ts: Dict[str, int] = {}
         self.min_quote_tte_ms = 3 * 60 * 1000
+        self.active_tickers = set()
+        self.recent_trade_ts = defaultdict(deque)
+        self.trade_history_ms = 10 * 60 * 1000
         
         # Ticker -> strike mapping for fair value ordering.
         # Supports legacy BTC-...-Txxxxx and new KXBTC-...-(B|T)xxxxx[.yy] styles.
@@ -62,10 +66,7 @@ class EngineLoop:
             "BTC-24DEC31-T110000",
             "BTC-24DEC31-T120000",
         ]
-        for ticker in seed_tickers:
-            strike = self._parse_strike_from_ticker(ticker)
-            if strike is not None:
-                self.ticker_to_strike[ticker] = strike
+        self.set_active_tickers(seed_tickers)
 
     @staticmethod
     def _parse_strike_from_ticker(ticker: str) -> float | None:
@@ -77,6 +78,43 @@ class EngineLoop:
             return float(m.group(2))
         except ValueError:
             return None
+
+    def set_active_tickers(self, tickers: list[str]):
+        normalized = [t for t in tickers if t]
+        new_set = set(normalized)
+        removed = self.active_tickers - new_set
+        self.active_tickers = new_set
+
+        for ticker in removed:
+            self._cancel_orders_for_ticker(ticker)
+            self.orderbooks.pop(ticker, None)
+            self.ticker_close_ts.pop(ticker, None)
+            self.ticker_to_strike.pop(ticker, None)
+            self.quoter.inventory.pop(ticker, None)
+            self.quoter.last_quotes.pop(ticker, None)
+            self.quoter.last_quote_time.pop(ticker, None)
+            self.risk.inventory.pop(ticker, None)
+            self.recent_trade_ts.pop(ticker, None)
+
+        for ticker in normalized:
+            strike = self._parse_strike_from_ticker(ticker)
+            if strike is not None:
+                self.ticker_to_strike[ticker] = strike
+
+    def recent_trade_count(self, window_ms: int, current_ts: int, tickers: list[str] | None = None) -> int:
+        if window_ms <= 0:
+            return 0
+        selected = tickers if tickers is not None else list(self.active_tickers)
+        cutoff = current_ts - window_ms
+        total = 0
+        for ticker in selected:
+            dq = self.recent_trade_ts.get(ticker)
+            if not dq:
+                continue
+            while dq and dq[0] < cutoff:
+                dq.popleft()
+            total += len(dq)
+        return total
         
     async def start(self):
         self.is_running = True
@@ -128,6 +166,12 @@ class EngineLoop:
             elif isinstance(event, TradeEvent):
                 await self.data_store.ingest_event("trade", event)
                 self.risk.last_kalshi_ts = event.exchange_ts
+                if event.ticker in self.active_tickers:
+                    dq = self.recent_trade_ts[event.ticker]
+                    dq.append(event.exchange_ts)
+                    trim_before = event.exchange_ts - self.trade_history_ms
+                    while dq and dq[0] < trim_before:
+                        dq.popleft()
                 if event.ticker not in self.ticker_to_strike:
                     strike = self._parse_strike_from_ticker(event.ticker)
                     if strike is not None:
@@ -150,7 +194,11 @@ class EngineLoop:
             elif isinstance(event, LifecycleEvent):
                 await self.data_store.ingest_event("lifecycle", event)
                 if event.status != "open":
-                    self.risk.trigger_risk_off(f"Market Lifecycle Closed for {event.ticker}")
+                    self.risk.trigger_risk_off(
+                        f"Market Lifecycle Closed for {event.ticker}",
+                        recoverable=False,
+                        current_ts=event.exchange_ts,
+                    )
 
     async def _resolve_paper_fills(self, batch: list[Any]):
         """Burn down queue_ahead using TradeEvents, record fills on YES/NO bid books."""
@@ -259,7 +307,10 @@ class EngineLoop:
         # 1. Compute fair values consistently
         spot = self.quant.last_spot
         eligible_tickers = []
-        for ticker, strike in self.ticker_to_strike.items():
+        for ticker in self.active_tickers:
+            strike = self.ticker_to_strike.get(ticker)
+            if strike is None:
+                continue
             close_ts = self.ticker_close_ts.get(ticker, 0)
             if close_ts <= 0:
                 continue
@@ -272,6 +323,15 @@ class EngineLoop:
         if not eligible_tickers:
             return
 
+        # Belt-and-suspenders: enforce one expiry ladder inside the engine.
+        by_close_ts: Dict[int, List[tuple[str, float, int]]] = {}
+        for item in eligible_tickers:
+            by_close_ts.setdefault(item[2], []).append(item)
+        selected_close_ts, selected_group = sorted(
+            by_close_ts.items(),
+            key=lambda kv: (-len(kv[1]), kv[0]),
+        )[0]
+        eligible_tickers = selected_group
         eligible_tickers.sort(key=lambda x: x[1])
         sorted_tickers = [t[0] for t in eligible_tickers]
         strikes = [t[1] for t in eligible_tickers]
@@ -280,8 +340,7 @@ class EngineLoop:
             if order.ticker not in eligible_set:
                 del self.active_orders[order_id]
 
-        min_close_ts = min(t[2] for t in eligible_tickers)
-        tte_years = self._years_to_expiry(min_close_ts, current_ts)
+        tte_years = self._years_to_expiry(selected_close_ts, current_ts)
         if tte_years <= 0:
             for ticker in sorted_tickers:
                 self._cancel_orders_for_ticker(ticker)
@@ -311,10 +370,10 @@ class EngineLoop:
                 continue
 
             # Kalshi is bids-only complement book:
-            # - Buy YES by resting YES_BID at quote.bid_cents
-            # - Sell YES by resting NO_BID at (100 - quote.ask_cents)
-            yes_bid_price = quote.bid_cents
-            no_bid_price = max(1, min(99, 100 - quote.ask_cents))
+            # - Buy YES by resting YES_BID at quote.yes_bid_cents
+            # - Sell YES by resting NO_BID at quote.no_bid_cents
+            yes_bid_price = quote.yes_bid_cents
+            no_bid_price = quote.no_bid_cents
 
             yes_qa = ob.yes_bids.get(yes_bid_price, 0)
             no_qa = ob.no_bids.get(no_bid_price, 0)

@@ -5,8 +5,8 @@ from dataclasses import dataclass
 @dataclass
 class Quote:
     ticker: str
-    bid_cents: int
-    ask_cents: int
+    yes_bid_cents: int
+    no_bid_cents: int
     size: int
 
 class Quoter:
@@ -52,31 +52,35 @@ class Quoter:
         # Base spread 1 cent, widened heavily by high volatility
         half_spread_cents = max(1, round(vol * 5.0)) 
         
-        bid = skewed_cents - half_spread_cents
-        ask = skewed_cents + half_spread_cents
+        yes_bid = skewed_cents - half_spread_cents
+        yes_ask = skewed_cents + half_spread_cents
         
         # Clamp to valid tick sizes [1, 99]
-        bid = max(1, min(98, bid))
-        ask = max(2, min(99, ask))
-        if bid >= ask:
-            bid = ask - 1
-            
+        yes_bid = max(1, min(98, yes_bid))
+        yes_ask = max(2, min(99, yes_ask))
+        if yes_bid >= yes_ask:
+            yes_bid = yes_ask - 1
+             
         # Fee clearance check: widen spread until it clears maker fees for both legs
-        fee_bid = self.get_maker_fee_cents(bid, quote_size)
-        fee_ask = self.get_maker_fee_cents(ask, quote_size)
+        fee_bid = self.get_maker_fee_cents(yes_bid, quote_size)
+        fee_ask = self.get_maker_fee_cents(yes_ask, quote_size)
         
         # Expected gross edge minus fees
-        if (ask - bid) * quote_size <= (fee_bid + fee_ask):
-            ask += 1
-            bid -= 1
-            bid = max(1, bid)
-            ask = min(99, ask)
-            
+        if (yes_ask - yes_bid) * quote_size <= (fee_bid + fee_ask):
+            yes_ask += 1
+            yes_bid -= 1
+            yes_bid = max(1, yes_bid)
+            yes_ask = min(99, yes_ask)
+             
         # If it still doesn't clear (due to clamping), we refuse to quote.
-        fee_bid = self.get_maker_fee_cents(bid, quote_size)
-        fee_ask = self.get_maker_fee_cents(ask, quote_size)
-        if (ask - bid) * quote_size <= (fee_bid + fee_ask):
+        fee_bid = self.get_maker_fee_cents(yes_bid, quote_size)
+        fee_ask = self.get_maker_fee_cents(yes_ask, quote_size)
+        if (yes_ask - yes_bid) * quote_size <= (fee_bid + fee_ask):
             return None 
+
+        # Kalshi bids-only representation:
+        # sell YES leg is posted as NO bid complement of YES ask.
+        no_bid = max(1, min(99, 100 - yes_ask))
 
         # Guardrail #8: Rate-Aware Quoter
         last_quote = self.last_quotes.get(ticker)
@@ -87,10 +91,10 @@ class Quoter:
             return last_quote
             
         # Only re-quote if target output changed by minimum of 1 tick
-        if last_quote and last_quote.bid_cents == bid and last_quote.ask_cents == ask:
+        if last_quote and last_quote.yes_bid_cents == yes_bid and last_quote.no_bid_cents == no_bid:
             return last_quote
 
-        quote = Quote(ticker, bid, ask, quote_size)
+        quote = Quote(ticker, yes_bid, no_bid, quote_size)
         self.last_quotes[ticker] = quote
         self.last_quote_time[ticker] = current_time_ms
         return quote

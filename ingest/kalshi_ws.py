@@ -44,6 +44,7 @@ class KalshiWSConsumer:
         self.event_queue = event_queue
         self.mode = (mode or "auto").lower()
         self.is_running = False
+        self._websocket = None
 
         self.reconnect_initial_sec = reconnect_initial_sec
         self.reconnect_max_sec = reconnect_max_sec
@@ -378,6 +379,7 @@ class KalshiWSConsumer:
                     ping_timeout=20,
                     max_size=8 * 1024 * 1024,
                 ) as websocket:
+                    self._websocket = websocket
                     logging.info("Connected to Kalshi websocket at %s", self.uri)
                     await self._subscribe(websocket)
                     retry_delay = self.reconnect_initial_sec
@@ -393,6 +395,8 @@ class KalshiWSConsumer:
                     break
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, self.reconnect_max_sec)
+            finally:
+                self._websocket = None
 
     async def start(self):
         self.is_running = True
@@ -416,6 +420,24 @@ class KalshiWSConsumer:
             return
 
         await self._run_real_stream()
+
+    async def stop(self):
+        self.is_running = False
+        ws = self._websocket
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    async def update_tickers(self, tickers: List[str]):
+        self.tickers = [t for t in tickers if t]
+        ws = self._websocket
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
 
     async def _handle_message(self, msg: str):
         ingest_ts = int(time.time() * 1000)

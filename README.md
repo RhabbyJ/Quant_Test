@@ -42,7 +42,13 @@ Event-driven Python MVP for a prediction-market maker simulation:
 - `MOCK_SPOT_INTERVAL_MS` (default: `1000`)
 - `WARMUP_SAMPLES` (default: `300`)
 - `KALSHI_HEARTBEAT_MS` (default: `30000`)
+- `RISK_AUTO_RECOVER_MS` (default: `10000`, auto-clear recoverable risk-off after healthy feeds)
 - `MIN_QUOTE_TTE_MS` (default: `180000`, 3 minutes)
+- `DEAD_MARKET_FAILOVER_ENABLED` (default: `true`)
+- `DEAD_MARKET_CHECK_SEC` (default: `30`)
+- `DEAD_MARKET_WINDOW_SEC` (default: `120`)
+- `DEAD_MARKET_MIN_TRADES` (default: `1`)
+- `DEAD_MARKET_COOLDOWN_SEC` (default: `120`)
 
 Note: avoid expired tickers (e.g. `BTC-24DEC31-*` are expired as of 2026-02-20). Discovery selects currently active `KXBTC` ladders automatically.
 

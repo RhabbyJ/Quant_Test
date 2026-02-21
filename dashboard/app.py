@@ -317,7 +317,9 @@ def _render_health_panel(spot_df: pd.DataFrame, trade_df: pd.DataFrame, ob_df: p
             f"discovery_used={runtime.get('discovery_used', False)} "
             f"close={runtime.get('discovered_close_iso','n/a')} "
             f"kalshi_heartbeat_ms={runtime.get('kalshi_heartbeat_ms','n/a')} "
+            f"risk_auto_recover_ms={runtime.get('risk_auto_recover_ms','n/a')} "
             f"min_quote_tte_ms={runtime.get('min_quote_tte_ms','n/a')} "
+            f"dead_failover={runtime.get('dead_market_failover_enabled', False)} "
             f"tickers={tickers_str}"
         )
 
