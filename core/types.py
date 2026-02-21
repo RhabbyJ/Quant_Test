@@ -60,6 +60,11 @@ class PaperFillEvent:
     size: int
     is_bid: bool
     side: Optional[str] = None
+    queue_ahead_at_fill: Optional[int] = None
+    time_since_quote_ms: Optional[int] = None
+    fair_prob_at_quote: Optional[float] = None
+    sigma_at_quote: Optional[float] = None
+    tte_ms_at_quote: Optional[int] = None
 
 @dataclass
 class SpotEvent:

@@ -32,6 +32,9 @@ class VirtualOrder:
     size: int
     queue_ahead: int
     placed_at_ts: int
+    fair_prob_at_quote: float
+    sigma_at_quote: float
+    tte_ms_at_quote: int
 
 class EngineLoop:
     """
@@ -220,10 +223,12 @@ class EngineLoop:
                     continue
 
                 # Conservative simulator model: any public trade at our resting level burns queue_ahead.
+                queue_ahead_before_burn = max(0, vorder.queue_ahead)
                 vorder.queue_ahead -= trade.size
                 
                 if vorder.queue_ahead < 0:
                     fill_qty = min(vorder.size, abs(vorder.queue_ahead))
+                    time_since_quote_ms = max(0, int(trade.exchange_ts - vorder.placed_at_ts))
                     
                     logging.info(f"PAPER FILL: {vorder.ticker} {vorder.side.value} {fill_qty} @ {vorder.price_cents}c")
                     
@@ -235,6 +240,11 @@ class EngineLoop:
                         size=fill_qty,
                         is_bid=(vorder.side == Side.YES_BID),
                         side=vorder.side.value,
+                        queue_ahead_at_fill=queue_ahead_before_burn,
+                        time_since_quote_ms=time_since_quote_ms,
+                        fair_prob_at_quote=vorder.fair_prob_at_quote,
+                        sigma_at_quote=vorder.sigma_at_quote,
+                        tte_ms_at_quote=vorder.tte_ms_at_quote,
                     )
                     await self.data_store.ingest_event("paper_fill", fill_event)
                     
@@ -274,6 +284,9 @@ class EngineLoop:
         size: int,
         queue_ahead: int,
         placed_at_ts: int,
+        fair_prob_at_quote: float,
+        sigma_at_quote: float,
+        tte_ms_at_quote: int,
     ):
         existing_id, existing = self._find_order_for_ticker_side(ticker, side)
         if existing and existing.price_cents == price_cents and existing.size == size:
@@ -290,6 +303,9 @@ class EngineLoop:
             size=size,
             queue_ahead=queue_ahead,
             placed_at_ts=placed_at_ts,
+            fair_prob_at_quote=fair_prob_at_quote,
+            sigma_at_quote=sigma_at_quote,
+            tte_ms_at_quote=tte_ms_at_quote,
         )
         self.active_orders[new_order.order_id] = new_order
         
@@ -341,6 +357,7 @@ class EngineLoop:
                 del self.active_orders[order_id]
 
         tte_years = self._years_to_expiry(selected_close_ts, current_ts)
+        tte_ms_at_quote = max(0, int(selected_close_ts - current_ts))
         if tte_years <= 0:
             for ticker in sorted_tickers:
                 self._cancel_orders_for_ticker(ticker)
@@ -385,6 +402,9 @@ class EngineLoop:
                 size=quote.size,
                 queue_ahead=yes_qa,
                 placed_at_ts=current_ts,
+                fair_prob_at_quote=val.prob,
+                sigma_at_quote=self.quant.sigma,
+                tte_ms_at_quote=tte_ms_at_quote,
             )
             self._upsert_virtual_order(
                 ticker=ticker,
@@ -393,4 +413,7 @@ class EngineLoop:
                 size=quote.size,
                 queue_ahead=no_qa,
                 placed_at_ts=current_ts,
+                fair_prob_at_quote=val.prob,
+                sigma_at_quote=self.quant.sigma,
+                tte_ms_at_quote=tte_ms_at_quote,
             )

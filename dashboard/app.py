@@ -5,8 +5,9 @@ import glob
 import json
 import logging
 import os
-from bisect import bisect_left
 from pathlib import Path
+
+from research.markouts import compute_fill_markouts, normalize_side
 
 st.set_page_config(layout="wide", page_title="Kalshi Institutional MM MVP")
 
@@ -141,148 +142,20 @@ def _load_runtime_status() -> dict:
 
 
 def _normalize_side(value) -> str:
-    if value is None:
-        return "unknown"
-    s = str(value).strip().lower()
-    if "yes_bid" in s or s == "yes":
-        return "yes_bid"
-    if "no_bid" in s or s == "no":
-        return "no_bid"
-    return s
-
-
-def _build_mid_series(ob_df: pd.DataFrame) -> dict[str, tuple[list[int], list[float]]]:
-    if ob_df.empty:
-        return {}
-    required = {"ticker", "exchange_ts", "side", "price_cents", "size"}
-    if not required.issubset(set(ob_df.columns)):
-        return {}
-
-    deltas = ob_df[list(required)].copy()
-    deltas["exchange_ts"] = pd.to_numeric(deltas["exchange_ts"], errors="coerce")
-    deltas["price_cents"] = pd.to_numeric(deltas["price_cents"], errors="coerce")
-    deltas["size"] = pd.to_numeric(deltas["size"], errors="coerce")
-    deltas["side"] = deltas["side"].map(_normalize_side)
-    deltas = deltas.dropna(subset=["exchange_ts", "price_cents", "size"])
-    if deltas.empty:
-        return {}
-
-    deltas["exchange_ts"] = deltas["exchange_ts"].astype("int64")
-    deltas["price_cents"] = deltas["price_cents"].astype("int64")
-    deltas["size"] = deltas["size"].astype("int64")
-    deltas = deltas.sort_values(["ticker", "exchange_ts"]).reset_index(drop=True)
-
-    yes_books: dict[str, dict[int, int]] = {}
-    no_books: dict[str, dict[int, int]] = {}
-    out_ts: dict[str, list[int]] = {}
-    out_mid: dict[str, list[float]] = {}
-
-    for row in deltas.itertuples(index=False):
-        ticker = str(row.ticker)
-        side = row.side
-        price = int(row.price_cents)
-        delta = int(row.size)
-        if side not in {"yes_bid", "no_bid"}:
-            continue
-
-        yes_book = yes_books.setdefault(ticker, {})
-        no_book = no_books.setdefault(ticker, {})
-        target = yes_book if side == "yes_bid" else no_book
-
-        new_size = target.get(price, 0) + delta
-        if new_size <= 0:
-            target.pop(price, None)
-        else:
-            target[price] = new_size
-
-        if not yes_book or not no_book:
-            continue
-
-        best_yes = max(yes_book.keys())
-        best_no = max(no_book.keys())
-        implied_yes_ask = 100 - best_no
-        mid_yes = (best_yes + implied_yes_ask) / 2.0
-
-        out_ts.setdefault(ticker, []).append(int(row.exchange_ts))
-        out_mid.setdefault(ticker, []).append(float(mid_yes))
-
-    mids: dict[str, tuple[list[int], list[float]]] = {}
-    for ticker, ts_vals in out_ts.items():
-        mids[ticker] = (ts_vals, out_mid.get(ticker, []))
-    return mids
+    return normalize_side(value)
 
 
 def _compute_markouts(fill_df: pd.DataFrame, ob_df: pd.DataFrame) -> pd.DataFrame:
-    if fill_df.empty:
-        return pd.DataFrame()
-    required = {"ticker", "exchange_ts", "price_cents", "size"}
-    if not required.issubset(set(fill_df.columns)):
-        return pd.DataFrame()
-
-    mids = _build_mid_series(ob_df)
-    if not mids:
-        return pd.DataFrame()
-
-    fills = fill_df.copy()
-    fills["exchange_ts"] = pd.to_numeric(fills["exchange_ts"], errors="coerce")
-    fills["price_cents"] = pd.to_numeric(fills["price_cents"], errors="coerce")
-    fills["size"] = pd.to_numeric(fills["size"], errors="coerce")
-    fills = fills.dropna(subset=["exchange_ts", "price_cents", "size"])
-    if fills.empty:
-        return pd.DataFrame()
-
-    if "side" in fills.columns:
-        fills["side_norm"] = fills["side"].map(_normalize_side)
-    elif "is_bid" in fills.columns:
-        fills["side_norm"] = fills["is_bid"].map(lambda b: "yes_bid" if bool(b) else "no_bid")
-    else:
-        fills["side_norm"] = "unknown"
-
-    horizons_sec = [1, 10, 60]
-    rows = []
-    for fill in fills.itertuples(index=False):
-        ticker = str(fill.ticker)
-        side = str(fill.side_norm)
-        if ticker not in mids or side not in {"yes_bid", "no_bid"}:
-            continue
-        ts_list, mid_list = mids[ticker]
-        if not ts_list or not mid_list:
-            continue
-
-        fill_ts = int(fill.exchange_ts)
-        fill_price = float(fill.price_cents)
-        size = int(fill.size)
-        fill_yes_price = fill_price if side == "yes_bid" else (100.0 - fill_price)
-        sign = 1.0 if side == "yes_bid" else -1.0
-
-        for h in horizons_sec:
-            target_ts = fill_ts + (h * 1000)
-            idx = bisect_left(ts_list, target_ts)
-            if idx >= len(ts_list):
-                continue
-            mid_after = float(mid_list[idx])
-            markout_cents = sign * (mid_after - fill_yes_price)
-            rows.append(
-                {
-                    "ticker": ticker,
-                    "side": side,
-                    "horizon_s": h,
-                    "fill_ts": fill_ts,
-                    "markout_cents": markout_cents,
-                    "size": size,
-                    "markout_usd": (markout_cents * size) / 100.0,
-                }
-            )
-
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows)
+    return compute_fill_markouts(fill_df=fill_df, ob_df=ob_df)
 
 
 def _render_health_panel(spot_df: pd.DataFrame, trade_df: pd.DataFrame, ob_df: pd.DataFrame):
     now_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
     warmup_samples = int(os.getenv("WARMUP_SAMPLES", "300"))
-    stale_sec = int(os.getenv("HEALTH_STALE_SEC", "15"))
+    runtime = _load_runtime_status()
+    heartbeat_ms_default = int(runtime.get("kalshi_heartbeat_ms", os.getenv("KALSHI_HEARTBEAT_MS", "30000")))
+    stale_default_sec = max(1, (heartbeat_ms_default + 999) // 1000)
+    stale_sec = int(os.getenv("HEALTH_STALE_SEC", str(stale_default_sec)))
 
     last_spot = _latest_exchange_ts_ms(spot_df)
     last_trade = _latest_exchange_ts_ms(trade_df)
@@ -306,7 +179,6 @@ def _render_health_panel(spot_df: pd.DataFrame, trade_df: pd.DataFrame, ob_df: p
     if not warmup_ready:
         st.caption(f"Warmup progress: spot_samples={len(spot_df)}/{warmup_samples}, orderbook_ready={not ob_df.empty}")
 
-    runtime = _load_runtime_status()
     if runtime:
         tickers = runtime.get("tickers", [])
         tickers_str = ", ".join(tickers[:3]) if tickers else "n/a"
@@ -317,6 +189,7 @@ def _render_health_panel(spot_df: pd.DataFrame, trade_df: pd.DataFrame, ob_df: p
             f"discovery_used={runtime.get('discovery_used', False)} "
             f"close={runtime.get('discovered_close_iso','n/a')} "
             f"kalshi_heartbeat_ms={runtime.get('kalshi_heartbeat_ms','n/a')} "
+            f"health_stale_sec={runtime.get('health_stale_sec','n/a')} "
             f"risk_auto_recover_ms={runtime.get('risk_auto_recover_ms','n/a')} "
             f"min_quote_tte_ms={runtime.get('min_quote_tte_ms','n/a')} "
             f"dead_failover={runtime.get('dead_market_failover_enabled', False)} "
@@ -374,6 +247,15 @@ def _render_live_panels(show_mock_spot: bool):
                 return f"background-color: {color}"
 
             display_cols = ["Time", "ticker", "side", "price_cents", "size"]
+            for col in [
+                "queue_ahead_at_fill",
+                "time_since_quote_ms",
+                "fair_prob_at_quote",
+                "sigma_at_quote",
+                "tte_ms_at_quote",
+            ]:
+                if col in fill_df.columns:
+                    display_cols.append(col)
             st.dataframe(fill_df[display_cols].head(20).style.map(highlight_side, subset=["side"]))
 
             yes_bids = fill_df[fill_df["side"] == "yes_bid"]["size"].sum()

@@ -42,6 +42,7 @@ Event-driven Python MVP for a prediction-market maker simulation:
 - `MOCK_SPOT_INTERVAL_MS` (default: `1000`)
 - `WARMUP_SAMPLES` (default: `300`)
 - `KALSHI_HEARTBEAT_MS` (default: `30000`)
+- `HEALTH_STALE_SEC` (optional dashboard threshold; defaults to `ceil(KALSHI_HEARTBEAT_MS/1000)`)
 - `RISK_AUTO_RECOVER_MS` (default: `10000`, auto-clear recoverable risk-off after healthy feeds)
 - `MIN_QUOTE_TTE_MS` (default: `180000`, 3 minutes)
 - `DEAD_MARKET_FAILOVER_ENABLED` (default: `true`)
@@ -91,3 +92,47 @@ streamlit run dashboard/app.py
 - `data_warehouse/orderbook_delta/...`
 - `data_warehouse/lifecycle/...`
 - `data_warehouse/runtime/status.json` (startup run config used by dashboard health panel)
+
+## Research Utilities
+- `research/markouts.py`: reusable exchange-timestamp markout computation from fills + orderbook deltas.
+- `research/loaders.py`: parquet channel loaders for offline analysis scripts.
+- `research/replay.py`: deterministic offline replay + quoter parameter sweep.
+- `research/compare_runs.py`: compare persisted replay/sweep runs (metrics/config/grid deltas).
+
+`paper_fill` rows now include quote-context fields for research:
+- `queue_ahead_at_fill`
+- `time_since_quote_ms`
+- `fair_prob_at_quote`
+- `sigma_at_quote`
+- `tte_ms_at_quote`
+
+### Replay Examples
+Single replay summary:
+```bash
+python -m research.replay --base-dir data_warehouse --warmup-samples 10 --kalshi-heartbeat-ms 120000 --spot-heartbeat-ms 120000
+```
+
+Bounded replay with ticker filter:
+```bash
+python -m research.replay --tickers KXBTC-26FEB2117-B68750 --start-ts-ms 1771705800000 --end-ts-ms 1771705877000
+```
+
+Parameter sweep (writes CSV):
+```bash
+python -m research.replay --tickers KXBTC-26FEB2117-B68750 --start-ts-ms 1771705800000 --end-ts-ms 1771705877000 --sweep vol_spread_mult=4,5,6 --sweep min_quote_lifetime_ms=500,1000 --out-csv research_sweep.csv
+```
+
+Persist replay artifacts by run-id:
+```bash
+python -m research.replay --tickers KXBTC-26FEB2117-B68750 --start-ts-ms 1771705800000 --end-ts-ms 1771705877000 --persist --run-root research_runs --run-id demo_replay_01
+```
+
+Compare two replay runs:
+```bash
+python -m research.compare_runs --run-root research_runs --base-run demo_replay_01 --candidate-run demo_replay_02
+```
+
+Compare two sweep runs:
+```bash
+python -m research.compare_runs --run-root research_runs --base-run demo_sweep_01 --candidate-run demo_sweep_02 --score markout_10s_total_usd
+```

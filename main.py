@@ -223,6 +223,9 @@ async def main():
         "discovered_reference_spot": discovered_ref_spot,
         "warmup_samples": engine.risk.warmup_samples,
         "kalshi_heartbeat_ms": engine.risk.kalshi_heartbeat_ms,
+        "health_stale_sec": int(
+            os.getenv("HEALTH_STALE_SEC", str(max(1, (engine.risk.kalshi_heartbeat_ms + 999) // 1000)))
+        ),
         "risk_auto_recover_ms": engine.risk.auto_recover_ms,
         "min_quote_tte_ms": engine.min_quote_tte_ms,
         "mock_spot_enabled": use_mock_spot,

@@ -14,9 +14,20 @@ class Quoter:
     Translates Fair Value probabilities into discrete Kalshi quote prices (cents).
     Enforces inventory skew, fee-cleared minimum spreads, and API throttling.
     """
-    def __init__(self, max_inventory: int = 1000):
+    def __init__(
+        self,
+        max_inventory: int = 1000,
+        inventory_skew_coef: float = 0.05,
+        vol_spread_mult: float = 5.0,
+        min_quote_lifetime_ms: int = 500,
+        atm_log_moneyness_limit: float = 0.02,
+    ):
         self.inventory: Dict[str, int] = {} # ticker -> net YES contracts
         self.max_inventory = max_inventory
+        self.inventory_skew_coef = inventory_skew_coef
+        self.vol_spread_mult = vol_spread_mult
+        self.min_quote_lifetime_ms = min_quote_lifetime_ms
+        self.atm_log_moneyness_limit = atm_log_moneyness_limit
         self.last_quotes: Dict[str, Quote] = {}
         self.last_quote_time: Dict[str, int] = {}
         
@@ -37,20 +48,20 @@ class Quoter:
         Guardrail #8 constraints applied: Throttle updates to avoid cancellation storms.
         """
         # Guardrail #5: Strike eligibility (Only quote strikes within ~2% of spot)
-        if spot <= 0 or abs(math.log(strike / spot)) > 0.02:
+        if spot <= 0 or abs(math.log(strike / spot)) > self.atm_log_moneyness_limit:
             return None
             
         # Inventory Skew (Shift mid downward if long YES, upward if short YES)
         net_pos = self.inventory.get(ticker, 0)
         # Max skew of 5% probability at max inventory limits
-        inventory_skew = (net_pos / self.max_inventory) * 0.05 
+        inventory_skew = (net_pos / self.max_inventory) * self.inventory_skew_coef
         
         skewed_prob = fair_prob - inventory_skew
         skewed_cents = round(skewed_prob * 100)
         
         # Volatility-based spread widening
         # Base spread 1 cent, widened heavily by high volatility
-        half_spread_cents = max(1, round(vol * 5.0)) 
+        half_spread_cents = max(1, round(vol * self.vol_spread_mult))
         
         yes_bid = skewed_cents - half_spread_cents
         yes_ask = skewed_cents + half_spread_cents
@@ -87,7 +98,7 @@ class Quoter:
         last_time = self.last_quote_time.get(ticker, 0)
         
         # Minimum quote lifetime = 500ms to avoid API churn
-        if current_time_ms - last_time < 500:
+        if current_time_ms - last_time < self.min_quote_lifetime_ms:
             return last_quote
             
         # Only re-quote if target output changed by minimum of 1 tick
