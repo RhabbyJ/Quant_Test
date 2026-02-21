@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 import requests
 import websockets
 
-from core.types import LifecycleEvent, OrderbookDeltaEvent, OrderbookSnapshotEvent, Side, TradeEvent
+from core.types import LifecycleEvent, MarketMetadataEvent, OrderbookDeltaEvent, OrderbookSnapshotEvent, Side, TradeEvent
 
 
 class KalshiWSConsumer:
@@ -235,6 +235,16 @@ class KalshiWSConsumer:
         )
         await self.event_queue.put(event)
 
+    async def _enqueue_market_meta(self, ticker: str, close_ts: int, status: Optional[str], ts_ms: int):
+        event = MarketMetadataEvent(
+            exchange_ts=ts_ms,
+            ingest_ts=int(time.time() * 1000),
+            ticker=ticker,
+            close_ts=close_ts,
+            status=status,
+        )
+        await self.event_queue.put(event)
+
     def _build_snapshot_headers(self, ticker: str) -> dict[str, str]:
         path = f"/trade-api/v2/markets/{ticker}/orderbook"
         return self._build_signed_headers("GET", path)
@@ -263,11 +273,39 @@ class KalshiWSConsumer:
             logging.error("Error fetching snapshot for %s: %s", ticker, e)
             return False
 
+    async def _fetch_market_metadata(self, ticker: str) -> bool:
+        path = f"/trade-api/v2/markets/{ticker}"
+        url = f"{self.rest_base_url}{path}"
+        ingest_ts = int(time.time() * 1000)
+        headers = self._build_signed_headers("GET", path) if self._auth_enabled() else {}
+
+        try:
+            resp = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
+            if resp.status_code != 200:
+                logging.error("Market metadata fetch failed for %s: %s %s", ticker, resp.status_code, resp.text)
+                return False
+
+            body = resp.json()
+            market = body.get("market", body)
+            close_raw = market.get("close_time") or market.get("close_ts") or market.get("expiration_time")
+            close_ts = self._parse_exchange_ts_ms(close_raw, 0)
+            if close_ts <= 0:
+                return False
+
+            status = str(market.get("status", "")).lower() or None
+            ts_ms = self._parse_exchange_ts_ms(market.get("updated_time"), ingest_ts)
+            await self._enqueue_market_meta(ticker, close_ts, status, ts_ms)
+            return True
+        except Exception as e:
+            logging.error("Error fetching market metadata for %s: %s", ticker, e)
+            return False
+
     async def _emit_synthetic_snapshot(self, ticker: str):
         ts = int(time.time() * 1000)
         yes_bids = [(49, 50), (48, 30), (47, 20)]
         no_bids = [(49, 50), (48, 30), (47, 20)]
         await self._enqueue_snapshot(ticker, yes_bids, no_bids, ts)
+        await self._enqueue_market_meta(ticker, ts + (24 * 3600 * 1000), "open", ts)
         logging.warning("Seeded synthetic snapshot for %s", ticker)
 
     async def _run_synthetic(self):
@@ -316,6 +354,7 @@ class KalshiWSConsumer:
         for ticker in self.tickers:
             if await self._fetch_snapshot(ticker):
                 successes += 1
+            await self._fetch_market_metadata(ticker)
 
         if successes == 0:
             logging.warning("No Kalshi snapshots loaded during bootstrap.")
@@ -437,6 +476,8 @@ class KalshiWSConsumer:
             ticker = payload.get("market_ticker")
             if not ticker:
                 return
+            if ticker not in self.tickers:
+                return
 
             ts_ms = self._parse_exchange_ts_ms(
                 payload.get("ts") or payload.get("updated_ts") or payload.get("close_ts"),
@@ -457,3 +498,7 @@ class KalshiWSConsumer:
                 seq=data.get("seq"),
             )
             await self.event_queue.put(event)
+            close_raw = payload.get("close_time") or payload.get("close_ts") or payload.get("expiration_time")
+            close_ts = self._parse_exchange_ts_ms(close_raw, 0)
+            if close_ts > 0:
+                await self._enqueue_market_meta(ticker, close_ts, status, ts_ms)

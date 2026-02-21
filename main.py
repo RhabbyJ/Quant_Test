@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
 
@@ -30,6 +32,21 @@ def _merge_no_proxy(existing: str, additions: list[str]) -> str:
     return ",".join(items)
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_write_runtime_status(path: str, payload: dict):
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(out_path)
+
+
 async def main():
     if load_dotenv:
         if Path(".env").exists():
@@ -46,22 +63,6 @@ async def main():
         os.environ["NO_PROXY"] = merged
         os.environ["no_proxy"] = merged
 
-    # 1. Tickers to subscribe to
-    tickers_env = os.getenv("KALSHI_TICKERS", "")
-    tickers = [t.strip() for t in tickers_env.split(",") if t.strip()] if tickers_env else [
-        "BTC-24DEC31-T100000",
-        "BTC-24DEC31-T110000",
-        "BTC-24DEC31-T120000",
-    ]
-
-    # 2. Initialize Parquet storage buffer
-    data_store = BufferedParquetWriter(data_dir="./data_warehouse", flush_interval_sec=2.0)
-    
-    # 3. Initialize the deterministic Engine Loop
-    engine = EngineLoop(data_store=data_store, tickers=tickers)
-    engine.risk.warmup_samples = int(os.getenv("WARMUP_SAMPLES", str(engine.risk.warmup_samples)))
-    
-    # 4. Initialize Kalshi WS Consumer
     kalshi_env = os.getenv("KALSHI_ENV", "demo").lower()
     ws_uri = (
         "wss://api.elections.kalshi.com/trade-api/ws/v2"
@@ -73,6 +74,83 @@ async def main():
         if kalshi_env == "prod"
         else "https://demo-api.kalshi.co"
     )
+
+    # 1. Tickers to subscribe to
+    tickers_env = os.getenv("KALSHI_TICKERS", "")
+    manual_tickers = [t.strip() for t in tickers_env.split(",") if t.strip()] if tickers_env else []
+    tickers = list(manual_tickers)
+    discovery_used = False
+    discovered_close_ts_ms = None
+    discovered_ref_spot = None
+
+    if _env_flag("KALSHI_DISCOVER_TICKERS", True):
+        try:
+            from ingest.discovery import discover_kxbtc_tickers
+
+            ref_spot = None
+            ref_spot_raw = os.getenv("KALSHI_DISCOVERY_SPOT")
+            if ref_spot_raw:
+                ref_spot = float(ref_spot_raw)
+            else:
+                mock_spot_raw = os.getenv("MOCK_SPOT_START")
+                if mock_spot_raw:
+                    ref_spot = float(mock_spot_raw)
+
+            result = await asyncio.to_thread(
+                discover_kxbtc_tickers,
+                rest_base_url=rest_base_url,
+                series_ticker=os.getenv("KALSHI_DISCOVERY_SERIES", "KXBTC"),
+                desired_count=int(os.getenv("KALSHI_DISCOVERY_COUNT", "3")),
+                min_close_min=int(os.getenv("KALSHI_DISCOVERY_MIN_CLOSE_MIN", "30")),
+                max_close_min=int(os.getenv("KALSHI_DISCOVERY_MAX_CLOSE_MIN", "180")),
+                reference_spot=ref_spot,
+                max_pages=int(os.getenv("KALSHI_DISCOVERY_MAX_PAGES", "6")),
+            )
+            if result.tickers:
+                tickers = result.tickers
+                discovery_used = True
+                discovered_close_ts_ms = result.close_ts_ms
+                discovered_ref_spot = result.reference_spot
+                close_iso = (
+                    datetime.fromtimestamp(result.close_ts_ms / 1000.0, tz=timezone.utc).isoformat()
+                    if result.close_ts_ms
+                    else "unknown"
+                )
+                logging.info(
+                    "Auto-discovery selected close=%s ref_spot=%s tickers=%s (candidates=%s)",
+                    close_iso,
+                    f"{result.reference_spot:.2f}" if result.reference_spot else "n/a",
+                    tickers,
+                    result.total_candidates,
+                )
+                for m in result.selected:
+                    logging.info(
+                        "Selected ticker=%s strike=%.2f activity=%.2f",
+                        m.ticker,
+                        m.strike,
+                        m.activity_score,
+                    )
+            else:
+                logging.warning("Auto-discovery returned no tickers; using manual KALSHI_TICKERS fallback.")
+        except Exception as e:
+            logging.warning("Auto-discovery failed (%s); using manual KALSHI_TICKERS fallback.", e)
+
+    if not tickers:
+        raise RuntimeError(
+            "No Kalshi tickers available. Set KALSHI_TICKERS or enable KALSHI_DISCOVER_TICKERS "
+            "with reachable Kalshi market data."
+        )
+
+    # 2. Initialize Parquet storage buffer
+    data_store = BufferedParquetWriter(data_dir="./data_warehouse", flush_interval_sec=2.0)
+    
+    # 3. Initialize the deterministic Engine Loop
+    engine = EngineLoop(data_store=data_store, tickers=tickers)
+    engine.risk.warmup_samples = int(os.getenv("WARMUP_SAMPLES", str(engine.risk.warmup_samples)))
+    engine.risk.kalshi_heartbeat_ms = int(os.getenv("KALSHI_HEARTBEAT_MS", str(engine.risk.kalshi_heartbeat_ms)))
+    engine.min_quote_tte_ms = int(os.getenv("MIN_QUOTE_TTE_MS", str(engine.min_quote_tte_ms)))
+    
+    # 4. Initialize Kalshi WS Consumer
 
     kalshi_ws = KalshiWSConsumer(
         uri=ws_uri,
@@ -99,11 +177,46 @@ async def main():
         interval_ms=spot_interval_ms,
     )
 
-    use_mock_spot = os.getenv("ENABLE_MOCK_SPOT", "true").lower() in {"1", "true", "yes", "on"}
+    use_mock_spot = _env_flag("ENABLE_MOCK_SPOT", True)
 
     logging.info("Starting Kalshi PM MVP Architecture")
-    logging.info("Kalshi mode=%s env=%s tickers=%s", os.getenv("KALSHI_MODE", "auto"), kalshi_env, tickers)
-    logging.info("Risk warmup_samples=%s mock_spot_start=%s", engine.risk.warmup_samples, spot_start_price)
+    logging.info(
+        "Kalshi mode=%s env=%s tickers=%s (discovery_used=%s)",
+        os.getenv("KALSHI_MODE", "auto"),
+        kalshi_env,
+        tickers,
+        discovery_used,
+    )
+    logging.info(
+        "Risk warmup_samples=%s kalshi_heartbeat_ms=%s min_quote_tte_ms=%s mock_spot_start=%s",
+        engine.risk.warmup_samples,
+        engine.risk.kalshi_heartbeat_ms,
+        engine.min_quote_tte_ms,
+        spot_start_price,
+    )
+
+    runtime_status = {
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "kalshi_env": kalshi_env,
+        "kalshi_mode": os.getenv("KALSHI_MODE", "auto"),
+        "tickers": tickers,
+        "discovery_used": discovery_used,
+        "discovered_close_ts_ms": discovered_close_ts_ms,
+        "discovered_close_iso": (
+            datetime.fromtimestamp(discovered_close_ts_ms / 1000.0, tz=timezone.utc).isoformat()
+            if discovered_close_ts_ms
+            else None
+        ),
+        "discovered_reference_spot": discovered_ref_spot,
+        "warmup_samples": engine.risk.warmup_samples,
+        "kalshi_heartbeat_ms": engine.risk.kalshi_heartbeat_ms,
+        "min_quote_tte_ms": engine.min_quote_tte_ms,
+        "mock_spot_enabled": use_mock_spot,
+        "mock_spot_start": spot_start_price if use_mock_spot else None,
+        "discovery_window_min_close_min": int(os.getenv("KALSHI_DISCOVERY_MIN_CLOSE_MIN", "30")),
+        "discovery_window_max_close_min": int(os.getenv("KALSHI_DISCOVERY_MAX_CLOSE_MIN", "180")),
+    }
+    _safe_write_runtime_status("data_warehouse/runtime/status.json", runtime_status)
 
     # Run everything concurrently
     tasks = [

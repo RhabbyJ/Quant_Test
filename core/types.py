@@ -44,6 +44,14 @@ class LifecycleEvent:
     seq: Optional[int] = None
 
 @dataclass
+class MarketMetadataEvent:
+    exchange_ts: int
+    ingest_ts: int
+    ticker: str
+    close_ts: int
+    status: Optional[str] = None
+
+@dataclass
 class PaperFillEvent:
     exchange_ts: int
     ingest_ts: int
@@ -51,6 +59,7 @@ class PaperFillEvent:
     price_cents: int
     size: int
     is_bid: bool
+    side: Optional[str] = None
 
 @dataclass
 class SpotEvent:

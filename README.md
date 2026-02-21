@@ -26,7 +26,14 @@ Event-driven Python MVP for a prediction-market maker simulation:
 ## Environment
 - `KALSHI_MODE` (default: `auto`)
 - `KALSHI_ENV` (`demo` or `prod`, default: `demo`)
-- `KALSHI_TICKERS` (comma-separated tickers)
+- `KALSHI_DISCOVER_TICKERS` (`true`/`false`, default: `true`)
+- `KALSHI_DISCOVERY_SERIES` (default: `KXBTC`)
+- `KALSHI_DISCOVERY_COUNT` (default: `3`)
+- `KALSHI_DISCOVERY_MIN_CLOSE_MIN` (default: `30`)
+- `KALSHI_DISCOVERY_MAX_CLOSE_MIN` (default: `180`)
+- `KALSHI_DISCOVERY_MAX_PAGES` (default: `6`)
+- `KALSHI_DISCOVERY_SPOT` (optional reference spot for ATM selection)
+- `KALSHI_TICKERS` (manual fallback comma-separated tickers)
 - `KALSHI_API_KEY_ID`
 - `KALSHI_PRIVATE_KEY_PATH` or `KALSHI_PRIVATE_KEY_PEM`
 - `KALSHI_PRIVATE_KEY_PASSWORD` (optional)
@@ -34,8 +41,10 @@ Event-driven Python MVP for a prediction-market maker simulation:
 - `MOCK_SPOT_START` (default: `110000`)
 - `MOCK_SPOT_INTERVAL_MS` (default: `1000`)
 - `WARMUP_SAMPLES` (default: `300`)
+- `KALSHI_HEARTBEAT_MS` (default: `30000`)
+- `MIN_QUOTE_TTE_MS` (default: `180000`, 3 minutes)
 
-Note: avoid expired tickers (e.g. `BTC-24DEC31-*` are expired as of 2026-02-20). Use currently active `KXBTC-...` tickers.
+Note: avoid expired tickers (e.g. `BTC-24DEC31-*` are expired as of 2026-02-20). Discovery selects currently active `KXBTC` ladders automatically.
 
 ## Setup
 ```bash
@@ -61,6 +70,7 @@ streamlit run dashboard/app.py
 ```
 
 ## What To Expect
+- If discovery is enabled, startup logs will print `Auto-discovery selected ...` with close time and chosen tickers.
 - Logs should show either:
   - `Fetched orderbook snapshot ...`, or
   - `Seeded synthetic snapshot ... (auth-bypass mode)`
@@ -74,3 +84,4 @@ streamlit run dashboard/app.py
 - `data_warehouse/paper_fill/...`
 - `data_warehouse/orderbook_delta/...`
 - `data_warehouse/lifecycle/...`
+- `data_warehouse/runtime/status.json` (startup run config used by dashboard health panel)

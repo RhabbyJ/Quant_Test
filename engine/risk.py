@@ -7,12 +7,20 @@ class RiskEngine:
         Guardrail #3: Warm-up gate
         Inventory Limits
     """
-    def __init__(self, max_inventory: int = 1000, spot_heartbeat_ms: int = 2000, warmup_samples: int = 300):
+    def __init__(
+        self,
+        max_inventory: int = 1000,
+        spot_heartbeat_ms: int = 2000,
+        kalshi_heartbeat_ms: int = 30000,
+        warmup_samples: int = 300,
+    ):
         self.max_inventory = max_inventory
         self.spot_heartbeat_ms = spot_heartbeat_ms
+        self.kalshi_heartbeat_ms = kalshi_heartbeat_ms
         self.warmup_samples = warmup_samples
         
         self.last_spot_ts = 0
+        self.last_kalshi_ts = 0
         self.inventory: Dict[str, int] = {}
         self.is_risk_off = False
         self.risk_off_reason = ""
@@ -21,6 +29,10 @@ class RiskEngine:
         """ Returns False if heartbeat failed, triggering Risk Off """
         if self.last_spot_ts > 0 and (current_ts - self.last_spot_ts) > self.spot_heartbeat_ms:
             self.trigger_risk_off("Spot feed stale / Clock jumped")
+            return False
+
+        if self.last_kalshi_ts > 0 and (current_ts - self.last_kalshi_ts) > self.kalshi_heartbeat_ms:
+            self.trigger_risk_off("Kalshi feed stale / No deltas-trades observed")
             return False
             
         return not self.is_risk_off

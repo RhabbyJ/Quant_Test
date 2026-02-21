@@ -20,6 +20,7 @@ class BufferedParquetWriter:
             "orderbook_delta": [],
             "trade": [],
             "lifecycle": [],
+            "market_meta": [],
             "spot": [],
             "paper_fill": []
         }
@@ -40,7 +41,7 @@ class BufferedParquetWriter:
             
             # Convert dataclass to dict handling Enum serialization
             event_dict = asdict(event)
-            if 'side' in event_dict and event_dict['side']:
+            if 'side' in event_dict and hasattr(event_dict['side'], "value"):
                 event_dict['side'] = event_dict['side'].value
                 
             self.buffers[channel].append(event_dict)

@@ -6,7 +6,16 @@ import re
 from typing import Any, Dict, List
 from dataclasses import dataclass
 
-from core.types import OrderbookDeltaEvent, TradeEvent, LifecycleEvent, SpotEvent, Side
+from core.types import (
+    LifecycleEvent,
+    MarketMetadataEvent,
+    OrderbookDeltaEvent,
+    OrderbookSnapshotEvent,
+    PaperFillEvent,
+    Side,
+    SpotEvent,
+    TradeEvent,
+)
 from data.store import BufferedParquetWriter
 from engine.orderbook import Orderbook
 from engine.quant import QuantEngine
@@ -17,7 +26,7 @@ from engine.risk import RiskEngine
 class VirtualOrder:
     order_id: str
     ticker: str
-    is_bid: bool
+    side: Side
     price_cents: int
     size: int
     queue_ahead: int
@@ -42,6 +51,8 @@ class EngineLoop:
         # Paper trading ledger
         self.active_orders: Dict[str, VirtualOrder] = {}
         self.is_running = False
+        self.ticker_close_ts: Dict[str, int] = {}
+        self.min_quote_tte_ms = 3 * 60 * 1000
         
         # Ticker -> strike mapping for fair value ordering.
         # Supports legacy BTC-...-Txxxxx and new KXBTC-...-(B|T)xxxxx[.yy] styles.
@@ -92,7 +103,6 @@ class EngineLoop:
                 
     async def _apply_exchange_events(self, batch: list[Any]):
         """Update L2 Books, Volatility Estimates, and Write to Storage"""
-        from core.types import OrderbookSnapshotEvent
         for event in batch:
             if isinstance(event, OrderbookSnapshotEvent):
                 # Don't persist snapshot blobs to parquet directly in this MVP to save complexity,
@@ -100,11 +110,16 @@ class EngineLoop:
                 ob = self.orderbooks.setdefault(event.ticker, Orderbook(event.ticker))
                 ob.apply_snapshot(event.yes_bids, event.no_bids)
                 logging.info(f"[{event.ticker}] Applied REST Snapshot")
+                if event.ticker not in self.ticker_to_strike:
+                    strike = self._parse_strike_from_ticker(event.ticker)
+                    if strike is not None:
+                        self.ticker_to_strike[event.ticker] = strike
                 
             elif isinstance(event, OrderbookDeltaEvent):
                 await self.data_store.ingest_event("orderbook_delta", event)
                 ob = self.orderbooks.setdefault(event.ticker, Orderbook(event.ticker))
                 ob.apply_delta(event)
+                self.risk.last_kalshi_ts = event.exchange_ts
                 if event.ticker not in self.ticker_to_strike:
                     strike = self._parse_strike_from_ticker(event.ticker)
                     if strike is not None:
@@ -112,6 +127,16 @@ class EngineLoop:
                 
             elif isinstance(event, TradeEvent):
                 await self.data_store.ingest_event("trade", event)
+                self.risk.last_kalshi_ts = event.exchange_ts
+                if event.ticker not in self.ticker_to_strike:
+                    strike = self._parse_strike_from_ticker(event.ticker)
+                    if strike is not None:
+                        self.ticker_to_strike[event.ticker] = strike
+
+            elif isinstance(event, MarketMetadataEvent):
+                await self.data_store.ingest_event("market_meta", event)
+                if event.close_ts > 0:
+                    self.ticker_close_ts[event.ticker] = event.close_ts
                 if event.ticker not in self.ticker_to_strike:
                     strike = self._parse_strike_from_ticker(event.ticker)
                     if strike is not None:
@@ -128,42 +153,97 @@ class EngineLoop:
                     self.risk.trigger_risk_off(f"Market Lifecycle Closed for {event.ticker}")
 
     async def _resolve_paper_fills(self, batch: list[Any]):
-        """Burn down queue_ahead using TradeEvents, record fills."""
+        """Burn down queue_ahead using TradeEvents, record fills on YES/NO bid books."""
         trades = [e for e in batch if isinstance(e, TradeEvent)]
         
         for trade in trades:
+            yes_trade_price = trade.price_cents
+            no_trade_price = 100 - trade.price_cents
+
             for order_id, vorder in list(self.active_orders.items()):
-                if vorder.ticker == trade.ticker and vorder.price_cents == trade.price_cents:
-                    # Very conservative: any public trade at our price burns our queue ahead
-                    vorder.queue_ahead -= trade.size
+                if vorder.ticker != trade.ticker:
+                    continue
+
+                matched = (
+                    (vorder.side == Side.YES_BID and vorder.price_cents == yes_trade_price)
+                    or (vorder.side == Side.NO_BID and vorder.price_cents == no_trade_price)
+                )
+                if not matched:
+                    continue
+
+                # Conservative simulator model: any public trade at our resting level burns queue_ahead.
+                vorder.queue_ahead -= trade.size
+                
+                if vorder.queue_ahead < 0:
+                    fill_qty = min(vorder.size, abs(vorder.queue_ahead))
                     
-                    if vorder.queue_ahead < 0:
-                        fill_qty = min(vorder.size, abs(vorder.queue_ahead))
-                        
-                        # Process Fill
-                        logging.info(f"PAPER FILL: {vorder.ticker} {fill_qty} contracts @ {vorder.price_cents}c")
-                        
-                        from core.types import PaperFillEvent
-                        fill_event = PaperFillEvent(
-                            exchange_ts=trade.exchange_ts,
-                            ingest_ts=int(time.time() * 1000),
-                            ticker=vorder.ticker,
-                            price_cents=vorder.price_cents,
-                            size=fill_qty,
-                            is_bid=vorder.is_bid
-                        )
-                        await self.data_store.ingest_event("paper_fill", fill_event)
-                        
-                        # Update Inventory
-                        direction = 1 if vorder.is_bid else -1
-                        self.quoter.inventory[vorder.ticker] = self.quoter.inventory.get(vorder.ticker, 0) + (fill_qty * direction)
-                        self.risk.update_inventory(vorder.ticker, fill_qty * direction)
-                        
-                        vorder.size -= fill_qty
-                        vorder.queue_ahead = 0
-                        
-                        if vorder.size <= 0:
-                            del self.active_orders[order_id]
+                    logging.info(f"PAPER FILL: {vorder.ticker} {vorder.side.value} {fill_qty} @ {vorder.price_cents}c")
+                    
+                    fill_event = PaperFillEvent(
+                        exchange_ts=trade.exchange_ts,
+                        ingest_ts=int(time.time() * 1000),
+                        ticker=vorder.ticker,
+                        price_cents=vorder.price_cents,
+                        size=fill_qty,
+                        is_bid=(vorder.side == Side.YES_BID),
+                        side=vorder.side.value,
+                    )
+                    await self.data_store.ingest_event("paper_fill", fill_event)
+                    
+                    # Inventory is tracked as net YES contracts.
+                    direction = 1 if vorder.side == Side.YES_BID else -1
+                    self.quoter.inventory[vorder.ticker] = self.quoter.inventory.get(vorder.ticker, 0) + (fill_qty * direction)
+                    self.risk.update_inventory(vorder.ticker, fill_qty * direction)
+                    
+                    vorder.size -= fill_qty
+                    vorder.queue_ahead = 0
+                    
+                    if vorder.size <= 0:
+                        del self.active_orders[order_id]
+
+    @staticmethod
+    def _years_to_expiry(close_ts_ms: int, now_ts_ms: int) -> float:
+        if close_ts_ms <= now_ts_ms:
+            return 0.0
+        return (close_ts_ms - now_ts_ms) / (365.0 * 24.0 * 3600.0 * 1000.0)
+
+    def _find_order_for_ticker_side(self, ticker: str, side: Side):
+        for order_id, order in self.active_orders.items():
+            if order.ticker == ticker and order.side == side:
+                return order_id, order
+        return None, None
+
+    def _cancel_orders_for_ticker(self, ticker: str):
+        for order_id, order in list(self.active_orders.items()):
+            if order.ticker == ticker:
+                del self.active_orders[order_id]
+
+    def _upsert_virtual_order(
+        self,
+        ticker: str,
+        side: Side,
+        price_cents: int,
+        size: int,
+        queue_ahead: int,
+        placed_at_ts: int,
+    ):
+        existing_id, existing = self._find_order_for_ticker_side(ticker, side)
+        if existing and existing.price_cents == price_cents and existing.size == size:
+            return
+
+        if existing_id:
+            del self.active_orders[existing_id]
+
+        new_order = VirtualOrder(
+            order_id=str(uuid.uuid4()),
+            ticker=ticker,
+            side=side,
+            price_cents=price_cents,
+            size=size,
+            queue_ahead=queue_ahead,
+            placed_at_ts=placed_at_ts,
+        )
+        self.active_orders[new_order.order_id] = new_order
         
     def _run_strategy_tick(self, current_ts: int):
         """Compute Fair value, bounds check inventory, send Virtual Orders"""
@@ -178,17 +258,44 @@ class EngineLoop:
 
         # 1. Compute fair values consistently
         spot = self.quant.last_spot
-        sorted_tickers = sorted(self.ticker_to_strike.keys(), key=lambda t: self.ticker_to_strike[t])
-        strikes = [self.ticker_to_strike[t] for t in sorted_tickers]
-        
-        # Dummy TTE (in reality, compute from Expiry - current_ts)
-        tte_years = 0.05 
+        eligible_tickers = []
+        for ticker, strike in self.ticker_to_strike.items():
+            close_ts = self.ticker_close_ts.get(ticker, 0)
+            if close_ts <= 0:
+                continue
+            if (close_ts - current_ts) <= self.min_quote_tte_ms:
+                continue
+            if ticker not in self.orderbooks:
+                continue
+            eligible_tickers.append((ticker, strike, close_ts))
+
+        if not eligible_tickers:
+            return
+
+        eligible_tickers.sort(key=lambda x: x[1])
+        sorted_tickers = [t[0] for t in eligible_tickers]
+        strikes = [t[1] for t in eligible_tickers]
+        eligible_set = set(sorted_tickers)
+        for order_id, order in list(self.active_orders.items()):
+            if order.ticker not in eligible_set:
+                del self.active_orders[order_id]
+
+        min_close_ts = min(t[2] for t in eligible_tickers)
+        tte_years = self._years_to_expiry(min_close_ts, current_ts)
+        if tte_years <= 0:
+            for ticker in sorted_tickers:
+                self._cancel_orders_for_ticker(ticker)
+            return
+
         fair_values = self.quant.compute_fair_values(spot, strikes, tte_years)
         
         # 2. Generate Quotes
-        self.active_orders.clear() # Simple cancel/replace every tick for MVP purposes if limits allow
-        
         for val, ticker in zip(fair_values, sorted_tickers):
+            ob = self.orderbooks.get(ticker)
+            if not ob or not ob.is_valid:
+                self._cancel_orders_for_ticker(ticker)
+                continue
+
             quote = self.quoter.generate_quote(
                 ticker=ticker,
                 fair_prob=val.prob,
@@ -199,17 +306,32 @@ class EngineLoop:
                 quote_size=10
             )
             
-            if quote:
-                ob = self.orderbooks.get(ticker)
-                
-                # Estimate Queue Ahead:
-                bid_qa = ob.yes_bids.get(quote.bid_cents, 0) if ob else 0
-                ask_qa = ob.yes_bids.get(quote.ask_cents, 0) if ob else 0 
-                # (Remember Kalshi is bids-only. Ask QA calculation implies translating NO_BIDs, 
-                # but for simpicity we assume 0 or derived here.)
-                
-                bid_order = VirtualOrder(str(uuid.uuid4()), ticker, True, quote.bid_cents, quote.size, bid_qa, current_ts)
-                ask_order = VirtualOrder(str(uuid.uuid4()), ticker, False, quote.ask_cents, quote.size, ask_qa, current_ts)
-                
-                self.active_orders[bid_order.order_id] = bid_order
-                self.active_orders[ask_order.order_id] = ask_order
+            if not quote:
+                self._cancel_orders_for_ticker(ticker)
+                continue
+
+            # Kalshi is bids-only complement book:
+            # - Buy YES by resting YES_BID at quote.bid_cents
+            # - Sell YES by resting NO_BID at (100 - quote.ask_cents)
+            yes_bid_price = quote.bid_cents
+            no_bid_price = max(1, min(99, 100 - quote.ask_cents))
+
+            yes_qa = ob.yes_bids.get(yes_bid_price, 0)
+            no_qa = ob.no_bids.get(no_bid_price, 0)
+
+            self._upsert_virtual_order(
+                ticker=ticker,
+                side=Side.YES_BID,
+                price_cents=yes_bid_price,
+                size=quote.size,
+                queue_ahead=yes_qa,
+                placed_at_ts=current_ts,
+            )
+            self._upsert_virtual_order(
+                ticker=ticker,
+                side=Side.NO_BID,
+                price_cents=no_bid_price,
+                size=quote.size,
+                queue_ahead=no_qa,
+                placed_at_ts=current_ts,
+            )
