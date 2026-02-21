@@ -55,6 +55,12 @@ class KalshiWSConsumer:
         self.rest_base_url = rest_base_url or self._derive_rest_base_from_ws(uri)
         self._warned_fractional_contracts = False
 
+        # WS health tracking
+        self.last_msg_ts: int = 0
+        self.last_delta_ts: int = 0
+        self.last_trade_ts: int = 0
+        self._health_log_interval_sec: float = 30.0
+
     @staticmethod
     def _derive_rest_base_from_ws(ws_uri: str) -> str:
         parsed = urlparse(ws_uri)
@@ -313,18 +319,53 @@ class KalshiWSConsumer:
         for ticker in self.tickers:
             await self._emit_synthetic_snapshot(ticker)
 
-        logging.warning("Running Kalshi synthetic mode: emitting synthetic trades.")
+        # Track a drifting mid-price per ticker for realistic synthetic data
+        synthetic_mids: dict[str, int] = {t: 50 for t in self.tickers}
+
+        logging.warning("Running Kalshi synthetic mode: emitting synthetic trades + deltas.")
         while self.is_running:
             await asyncio.sleep(1.0)
             ts = int(time.time() * 1000)
             for ticker in self.tickers:
+                # Drift the mid-price slightly each tick
+                drift = random.choice([-1, 0, 0, 0, 1])
+                synthetic_mids[ticker] = max(20, min(80, synthetic_mids[ticker] + drift))
+                mid = synthetic_mids[ticker]
+
+                # Re-seed snapshot each tick to keep book uncrossed, then emit
+                # deltas at the best levels for Parquet (dashboard reads deltas).
+                spread = random.randint(2, 4)
+                yes_bid_price = max(1, mid - spread // 2)
+                no_bid_price = max(1, 100 - mid - (spread - spread // 2))
+                yes_bids = [(yes_bid_price, random.randint(10, 50))]
+                no_bids = [(no_bid_price, random.randint(10, 50))]
+                await self._enqueue_snapshot(ticker, yes_bids, no_bids, ts)
+
+                # Write deltas at same levels so Parquet orderbook_delta channel populates
+                for side, price, sz in [
+                    (Side.YES_BID, yes_bid_price, yes_bids[0][1]),
+                    (Side.NO_BID, no_bid_price, no_bids[0][1]),
+                ]:
+                    delta = OrderbookDeltaEvent(
+                        exchange_ts=ts,
+                        ingest_ts=ts,
+                        ticker=ticker,
+                        price_cents=price,
+                        size=sz,
+                        side=side,
+                        seq=None,
+                    )
+                    await self.event_queue.put(delta)
+
+                # Emit a trade with randomized side
+                trade_side = random.choice([Side.YES_BID, Side.NO_BID])
                 trade = TradeEvent(
                     exchange_ts=ts,
                     ingest_ts=ts,
                     ticker=ticker,
-                    price_cents=random.randint(45, 55),
+                    price_cents=mid + random.randint(-3, 3),
                     size=random.randint(1, 5),
-                    side=Side.YES_BID,
+                    side=trade_side,
                     seq=None,
                 )
                 await self.event_queue.put(trade)
@@ -398,6 +439,38 @@ class KalshiWSConsumer:
             finally:
                 self._websocket = None
 
+    async def _ws_health_logger(self):
+        """Periodically log WS connection health for diagnostics."""
+        while self.is_running:
+            await asyncio.sleep(self._health_log_interval_sec)
+            now = int(time.time() * 1000)
+            msg_age = (now - self.last_msg_ts) if self.last_msg_ts > 0 else None
+            delta_age = (now - self.last_delta_ts) if self.last_delta_ts > 0 else None
+            trade_age = (now - self.last_trade_ts) if self.last_trade_ts > 0 else None
+            logging.info(
+                "WS HEALTH: last_msg=%s last_delta=%s last_trade=%s",
+                f"{msg_age}ms" if msg_age is not None else "never",
+                f"{delta_age}ms" if delta_age is not None else "never",
+                f"{trade_age}ms" if trade_age is not None else "never",
+            )
+
+    async def _rest_bbo_fallback_loop(self):
+        """Poll REST snapshots when WS deltas go stale, keeping the book alive."""
+        bbo_poll_sec = 5.0
+        stale_threshold_ms = 15_000
+        while self.is_running:
+            await asyncio.sleep(bbo_poll_sec)
+            now = int(time.time() * 1000)
+            delta_age = (now - self.last_delta_ts) if self.last_delta_ts > 0 else now
+            if delta_age < stale_threshold_ms:
+                continue
+            # WS deltas are stale — poll REST snapshots as fallback
+            for ticker in self.tickers:
+                try:
+                    await self._fetch_snapshot(ticker)
+                except Exception as e:
+                    logging.warning("REST BBO fallback failed for %s: %s", ticker, e)
+
     async def start(self):
         self.is_running = True
 
@@ -419,7 +492,12 @@ class KalshiWSConsumer:
             await self._run_synthetic()
             return
 
-        await self._run_real_stream()
+        # Run the real stream alongside health logger and BBO fallback
+        await asyncio.gather(
+            self._run_real_stream(),
+            self._ws_health_logger(),
+            self._rest_bbo_fallback_loop(),
+        )
 
     async def stop(self):
         self.is_running = False
@@ -441,6 +519,7 @@ class KalshiWSConsumer:
 
     async def _handle_message(self, msg: str):
         ingest_ts = int(time.time() * 1000)
+        self.last_msg_ts = ingest_ts
         try:
             data = json.loads(msg)
         except json.JSONDecodeError:
@@ -468,6 +547,7 @@ class KalshiWSConsumer:
 
         if msg_type == "orderbook_delta":
             ts_ms = self._parse_exchange_ts_ms(payload.get("ts"), ingest_ts)
+            self.last_delta_ts = ingest_ts
             event = OrderbookDeltaEvent(
                 exchange_ts=ts_ms,
                 ingest_ts=ingest_ts,
@@ -482,6 +562,7 @@ class KalshiWSConsumer:
 
         if msg_type == "trade":
             ts_ms = self._parse_exchange_ts_ms(payload.get("ts"), ingest_ts)
+            self.last_trade_ts = ingest_ts
             event = TradeEvent(
                 exchange_ts=ts_ms,
                 ingest_ts=ingest_ts,
