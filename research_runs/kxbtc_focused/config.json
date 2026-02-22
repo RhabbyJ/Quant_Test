@@ -1,0 +1,15 @@
+{
+  "base_dir": "data_warehouse",
+  "end_ts_ms": null,
+  "kalshi_heartbeat_ms": null,
+  "min_quote_tte_ms": null,
+  "quoter_overrides": {},
+  "spot_heartbeat_ms": null,
+  "start_ts_ms": null,
+  "tickers": [
+    "KXBTC-26FEB2117-B68250",
+    "KXBTC-26FEB2117-B67750",
+    "KXBTC-26FEB2117-B68750"
+  ],
+  "warmup_samples": null
+}
