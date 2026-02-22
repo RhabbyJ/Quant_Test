@@ -161,6 +161,9 @@ async def main():
     engine.risk.kalshi_heartbeat_ms = int(os.getenv("KALSHI_HEARTBEAT_MS", str(engine.risk.kalshi_heartbeat_ms)))
     engine.risk.auto_recover_ms = int(os.getenv("RISK_AUTO_RECOVER_MS", str(engine.risk.auto_recover_ms)))
     engine.min_quote_tte_ms = int(os.getenv("MIN_QUOTE_TTE_MS", str(engine.min_quote_tte_ms)))
+    if os.getenv("EWMA_DECAY_FACTOR"):
+        engine.quant.decay_factor = float(os.getenv("EWMA_DECAY_FACTOR"))
+    engine.quant.half_life_seconds = float(os.getenv("VOL_HALF_LIFE_SEC", str(engine.quant.half_life_seconds)))
     
     # 4. Initialize Kalshi WS Consumer
 
@@ -200,11 +203,14 @@ async def main():
         discovery_used,
     )
     logging.info(
-        "Risk warmup_samples=%s kalshi_heartbeat_ms=%s auto_recover_ms=%s min_quote_tte_ms=%s mock_spot_start=%s",
+        "Risk warmup_samples=%s kalshi_heartbeat_ms=%s auto_recover_ms=%s min_quote_tte_ms=%s "
+        "vol_half_life_sec=%s ewma_decay_factor=%s mock_spot_start=%s",
         engine.risk.warmup_samples,
         engine.risk.kalshi_heartbeat_ms,
         engine.risk.auto_recover_ms,
         engine.min_quote_tte_ms,
+        engine.quant.half_life_seconds,
+        engine.quant.decay_factor,
         spot_start_price,
     )
 
@@ -223,6 +229,8 @@ async def main():
         "discovered_reference_spot": discovered_ref_spot,
         "warmup_samples": engine.risk.warmup_samples,
         "kalshi_heartbeat_ms": engine.risk.kalshi_heartbeat_ms,
+        "vol_half_life_sec": engine.quant.half_life_seconds,
+        "ewma_decay_factor": engine.quant.decay_factor,
         "health_stale_sec": int(
             os.getenv("HEALTH_STALE_SEC", str(max(1, (engine.risk.kalshi_heartbeat_ms + 999) // 1000)))
         ),

@@ -193,6 +193,10 @@ def _build_replay_events(data: dict[str, pd.DataFrame]) -> list[tuple[int, int, 
                     ticker=str(row.get("ticker", "")),
                     close_ts=_to_int(row.get("close_ts")),
                     status=str(row.get("status", "")).lower() or None,
+                    direction=str(row.get("direction", "")).lower() or None,
+                    strike_low=_to_float(row.get("strike_low")) if "strike_low" in row else None,
+                    strike_high=_to_float(row.get("strike_high")) if "strike_high" in row else None,
+                    settlement_window=str(row.get("settlement_window", "")) or None,
                 ),
             )
         )

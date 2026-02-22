@@ -141,6 +141,9 @@ def compute_fill_markouts(
         size = int(fill.size)
         fill_yes_price = fill_price if side == "yes_bid" else (100.0 - fill_price)
         sign = 1.0 if side == "yes_bid" else -1.0
+        fair_prob_at_quote = float(fill.fair_prob_at_quote) if hasattr(fill, "fair_prob_at_quote") and fill.fair_prob_at_quote is not None else None
+        sigma_at_quote = float(fill.sigma_at_quote) if hasattr(fill, "sigma_at_quote") and fill.sigma_at_quote is not None else None
+        tte_ms_at_quote = int(fill.tte_ms_at_quote) if hasattr(fill, "tte_ms_at_quote") and fill.tte_ms_at_quote is not None else None
 
         for h in horizons_sec:
             target_ts = fill_ts + (int(h) * 1000)
@@ -160,13 +163,19 @@ def compute_fill_markouts(
                     "fill_ts": fill_ts,
                     "mid_sample_ts": mid_sample_ts,
                     "mid_sample_dt_ms": abs(mid_sample_ts - target_ts),
+                    "fill_yes_price": fill_yes_price,
+                    "mid_yes_after": mid_after,
+                    "realized_yes_prob": mid_after / 100.0,
                     "markout_cents": markout_cents,
+                    "signed_markout_cents": markout_cents,
                     "size": size,
                     "markout_usd": (markout_cents * size) / 100.0,
+                    "fair_prob_at_quote": fair_prob_at_quote,
+                    "sigma_at_quote": sigma_at_quote,
+                    "tte_ms_at_quote": tte_ms_at_quote,
                 }
             )
 
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows)
-

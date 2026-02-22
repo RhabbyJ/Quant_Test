@@ -13,6 +13,7 @@ from core.types import (
     OrderbookDeltaEvent,
     OrderbookSnapshotEvent,
     PaperFillEvent,
+    QuoteAuditEvent,
     Side,
     SpotEvent,
     TradeEvent,
@@ -35,6 +36,15 @@ class VirtualOrder:
     fair_prob_at_quote: float
     sigma_at_quote: float
     tte_ms_at_quote: int
+
+@dataclass
+class ContractSpec:
+    ticker: str
+    direction: str
+    strike_low: float | None
+    strike_high: float | None
+    expiration_ts: int
+    settlement_window: str | None
 
 class EngineLoop:
     """
@@ -60,6 +70,9 @@ class EngineLoop:
         self.active_tickers = set()
         self.recent_trade_ts = defaultdict(deque)
         self.trade_history_ms = 10 * 60 * 1000
+        self.ticker_direction: Dict[str, str] = {}
+        self.contract_specs: Dict[str, ContractSpec] = {}
+        self._logged_contract_specs = set()
         
         # Ticker -> strike mapping for fair value ordering.
         # Supports legacy BTC-...-Txxxxx and new KXBTC-...-(B|T)xxxxx[.yy] styles.
@@ -72,15 +85,17 @@ class EngineLoop:
         self.set_active_tickers(seed_tickers)
 
     @staticmethod
-    def _parse_strike_from_ticker(ticker: str) -> float | None:
+    def _parse_contract_from_ticker(ticker: str) -> tuple[float | None, str]:
         # Match suffixes like T100000, T75999.99, B70125.
         m = re.search(r"(?:-|^)([TB])(\d+(?:\.\d+)?)$", ticker)
         if not m:
-            return None
+            return None, "above"
         try:
-            return float(m.group(2))
+            strike = float(m.group(2))
+            direction = "below" if m.group(1) == "B" else "above"
+            return strike, direction
         except ValueError:
-            return None
+            return None, "above"
 
     def set_active_tickers(self, tickers: list[str]):
         normalized = [t for t in tickers if t]
@@ -93,6 +108,8 @@ class EngineLoop:
             self.orderbooks.pop(ticker, None)
             self.ticker_close_ts.pop(ticker, None)
             self.ticker_to_strike.pop(ticker, None)
+            self.ticker_direction.pop(ticker, None)
+            self.contract_specs.pop(ticker, None)
             self.quoter.inventory.pop(ticker, None)
             self.quoter.last_quotes.pop(ticker, None)
             self.quoter.last_quote_time.pop(ticker, None)
@@ -100,9 +117,10 @@ class EngineLoop:
             self.recent_trade_ts.pop(ticker, None)
 
         for ticker in normalized:
-            strike = self._parse_strike_from_ticker(ticker)
+            strike, direction = self._parse_contract_from_ticker(ticker)
             if strike is not None:
                 self.ticker_to_strike[ticker] = strike
+            self.ticker_direction[ticker] = direction
 
     def recent_trade_count(self, window_ms: int, current_ts: int, tickers: list[str] | None = None) -> int:
         if window_ms <= 0:
@@ -134,7 +152,7 @@ class EngineLoop:
                     
                 await self._apply_exchange_events(batch)
                 await self._resolve_paper_fills(batch)
-                self._run_strategy_tick(batch[-1].exchange_ts)
+                await self._run_strategy_tick(batch[-1].exchange_ts)
                 
                 for _ in batch:
                     self.event_queue.task_done()
@@ -150,11 +168,13 @@ class EngineLoop:
                 # just initialize the local L2 book so delta updates have a base.
                 ob = self.orderbooks.setdefault(event.ticker, Orderbook(event.ticker))
                 ob.apply_snapshot(event.yes_bids, event.no_bids)
+                self.risk.last_kalshi_ts = event.exchange_ts
                 logging.info(f"[{event.ticker}] Applied REST Snapshot")
                 if event.ticker not in self.ticker_to_strike:
-                    strike = self._parse_strike_from_ticker(event.ticker)
+                    strike, direction = self._parse_contract_from_ticker(event.ticker)
                     if strike is not None:
                         self.ticker_to_strike[event.ticker] = strike
+                    self.ticker_direction[event.ticker] = direction
                 
             elif isinstance(event, OrderbookDeltaEvent):
                 await self.data_store.ingest_event("orderbook_delta", event)
@@ -162,9 +182,10 @@ class EngineLoop:
                 ob.apply_delta(event)
                 self.risk.last_kalshi_ts = event.exchange_ts
                 if event.ticker not in self.ticker_to_strike:
-                    strike = self._parse_strike_from_ticker(event.ticker)
+                    strike, direction = self._parse_contract_from_ticker(event.ticker)
                     if strike is not None:
                         self.ticker_to_strike[event.ticker] = strike
+                    self.ticker_direction[event.ticker] = direction
                 
             elif isinstance(event, TradeEvent):
                 await self.data_store.ingest_event("trade", event)
@@ -176,26 +197,75 @@ class EngineLoop:
                     while dq and dq[0] < trim_before:
                         dq.popleft()
                 if event.ticker not in self.ticker_to_strike:
-                    strike = self._parse_strike_from_ticker(event.ticker)
+                    strike, direction = self._parse_contract_from_ticker(event.ticker)
                     if strike is not None:
                         self.ticker_to_strike[event.ticker] = strike
+                    self.ticker_direction[event.ticker] = direction
 
             elif isinstance(event, MarketMetadataEvent):
                 await self.data_store.ingest_event("market_meta", event)
+                self.risk.last_kalshi_ts = event.exchange_ts
                 if event.close_ts > 0:
                     self.ticker_close_ts[event.ticker] = event.close_ts
-                if event.ticker not in self.ticker_to_strike:
-                    strike = self._parse_strike_from_ticker(event.ticker)
-                    if strike is not None:
-                        self.ticker_to_strike[event.ticker] = strike
+                # Prefer exchange-provided contract fields when available.
+                direction = (event.direction or "").lower() if event.direction else None
+                if direction not in {"above", "below", "range"}:
+                    _, suffix_dir = self._parse_contract_from_ticker(event.ticker)
+                    direction = suffix_dir
+                self.ticker_direction[event.ticker] = direction
+
+                low = event.strike_low
+                high = event.strike_high
+                strike_for_model = None
+                if low is not None and high is not None:
+                    strike_for_model = (float(low) + float(high)) / 2.0
+                elif low is not None:
+                    strike_for_model = float(low)
+                elif high is not None:
+                    strike_for_model = float(high)
+                if strike_for_model is None:
+                    strike, _ = self._parse_contract_from_ticker(event.ticker)
+                    strike_for_model = strike
+                if strike_for_model is not None:
+                    self.ticker_to_strike[event.ticker] = strike_for_model
+
+                spec = ContractSpec(
+                    ticker=event.ticker,
+                    direction=direction,
+                    strike_low=float(low) if low is not None else None,
+                    strike_high=float(high) if high is not None else None,
+                    expiration_ts=int(event.close_ts),
+                    settlement_window=event.settlement_window,
+                )
+                self.contract_specs[event.ticker] = spec
+                spec_key = (
+                    spec.ticker,
+                    spec.direction,
+                    spec.strike_low,
+                    spec.strike_high,
+                    spec.expiration_ts,
+                    spec.settlement_window,
+                )
+                if spec_key not in self._logged_contract_specs:
+                    self._logged_contract_specs.add(spec_key)
+                    logging.info(
+                        "CONTRACT SPEC ticker=%s direction=%s strike_low=%s strike_high=%s close_ts=%s settlement=%s",
+                        spec.ticker,
+                        spec.direction,
+                        spec.strike_low,
+                        spec.strike_high,
+                        spec.expiration_ts,
+                        spec.settlement_window,
+                    )
                 
             elif isinstance(event, SpotEvent):
                 await self.data_store.ingest_event("spot", event)
                 self.risk.last_spot_ts = event.exchange_ts
-                self.quant.update_spot(event.price)
+                self.quant.update_spot(event.price, event.exchange_ts)
                 
             elif isinstance(event, LifecycleEvent):
                 await self.data_store.ingest_event("lifecycle", event)
+                self.risk.last_kalshi_ts = event.exchange_ts
                 if event.status != "open":
                     self.risk.trigger_risk_off(
                         f"Market Lifecycle Closed for {event.ticker}",
@@ -309,7 +379,7 @@ class EngineLoop:
         )
         self.active_orders[new_order.order_id] = new_order
         
-    def _run_strategy_tick(self, current_ts: int):
+    async def _run_strategy_tick(self, current_ts: int):
         """Compute Fair value, bounds check inventory, send Virtual Orders"""
         # Guardrail #2: Heartbeat check
         if not self.risk.check_heartbeat(current_ts):
@@ -372,19 +442,46 @@ class EngineLoop:
                 self._cancel_orders_for_ticker(ticker)
                 continue
 
+            direction = self.ticker_direction.get(ticker, "above")
+            if direction == "range":
+                self._cancel_orders_for_ticker(ticker)
+                continue
+            fair_prob = val.prob if direction != "below" else (1.0 - val.prob)
+            fair_prob = max(0.001, min(0.999, fair_prob))
+
             quote = self.quoter.generate_quote(
                 ticker=ticker,
-                fair_prob=val.prob,
+                fair_prob=fair_prob,
                 spot=spot,
                 strike=val.strike,
                 current_time_ms=current_ts,
                 vol=self.quant.sigma,
-                quote_size=10
+                quote_size=10,
+                tte_years=tte_years,
             )
             
             if not quote:
                 self._cancel_orders_for_ticker(ticker)
                 continue
+
+            is_new_quote = self.quoter.last_quote_time.get(ticker, 0) == current_ts
+            if is_new_quote:
+                audit_event = QuoteAuditEvent(
+                    exchange_ts=current_ts,
+                    ingest_ts=int(time.time() * 1000),
+                    ticker=ticker,
+                    fair_prob=float(quote.fair_prob),
+                    sigma=float(quote.sigma),
+                    tte_ms=tte_ms_at_quote,
+                    sigma_t=float(quote.sigma_t),
+                    inventory=int(quote.inventory),
+                    inventory_skew=float(quote.inventory_skew),
+                    yes_bid_cents=int(quote.yes_bid_cents),
+                    no_bid_cents=int(quote.no_bid_cents),
+                    half_spread_cents=int(quote.half_spread_cents),
+                    fee_widen_steps=int(quote.fee_widen_steps),
+                )
+                await self.data_store.ingest_event("quote_audit", audit_event)
 
             # Kalshi is bids-only complement book:
             # - Buy YES by resting YES_BID at quote.yes_bid_cents
@@ -402,7 +499,7 @@ class EngineLoop:
                 size=quote.size,
                 queue_ahead=yes_qa,
                 placed_at_ts=current_ts,
-                fair_prob_at_quote=val.prob,
+                fair_prob_at_quote=fair_prob,
                 sigma_at_quote=self.quant.sigma,
                 tte_ms_at_quote=tte_ms_at_quote,
             )
@@ -413,7 +510,7 @@ class EngineLoop:
                 size=quote.size,
                 queue_ahead=no_qa,
                 placed_at_ts=current_ts,
-                fair_prob_at_quote=val.prob,
+                fair_prob_at_quote=fair_prob,
                 sigma_at_quote=self.quant.sigma,
                 tte_ms_at_quote=tte_ms_at_quote,
             )

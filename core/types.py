@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Optional, Literal
+from typing import Optional
 from enum import Enum
 
 class Side(Enum):
@@ -50,6 +50,10 @@ class MarketMetadataEvent:
     ticker: str
     close_ts: int
     status: Optional[str] = None
+    direction: Optional[str] = None   # above | below | range
+    strike_low: Optional[float] = None
+    strike_high: Optional[float] = None
+    settlement_window: Optional[str] = None
 
 @dataclass
 class PaperFillEvent:
@@ -72,3 +76,20 @@ class SpotEvent:
     ingest_ts: int
     ticker: str # e.g. "BTC"
     price: float
+
+
+@dataclass
+class QuoteAuditEvent:
+    exchange_ts: int
+    ingest_ts: int
+    ticker: str
+    fair_prob: float
+    sigma: float
+    tte_ms: int
+    sigma_t: float
+    inventory: int
+    inventory_skew: float
+    yes_bid_cents: int
+    no_bid_cents: int
+    half_spread_cents: int
+    fee_widen_steps: int

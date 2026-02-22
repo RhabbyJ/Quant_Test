@@ -13,27 +13,49 @@ class QuantEngine:
     Calculates moving Volatility (EWMA) and Computes Fair Value for a set of strikes,
     enforcing surface consistency via PAVA.
     """
-    def __init__(self, decay_factor: float = 0.94):
+    def __init__(self, decay_factor: float | None = None, half_life_seconds: float = 300.0):
+        # If decay_factor is provided, use fixed-lambda legacy behavior.
+        # Otherwise derive lambda from elapsed time and half-life.
         self.decay_factor = decay_factor
+        self.half_life_seconds = max(1.0, float(half_life_seconds))
         self.variance = 0.0
         self.last_spot = None
+        self.last_spot_ts_ms = None
         self.sigma = 0.0  # Annualized volatility
         self.samples_collected = 0
     
-    def update_spot(self, price: float) -> float:
+    def _lambda_for_dt(self, dt_sec: float) -> float:
+        if self.decay_factor is not None:
+            return float(self.decay_factor)
+        # Exponential EWMA decay with target half-life.
+        return math.exp(-math.log(2.0) * (dt_sec / self.half_life_seconds))
+
+    def update_spot(self, price: float, exchange_ts_ms: int | None = None) -> float:
         """
-        Computes 1-second sample EWMA Variance.
+        Computes EWMA Variance from log returns.
         Returns Annualized Volatility.
         """
         if self.last_spot is not None:
             ret = math.log(price / self.last_spot)
-            self.variance = self.decay_factor * self.variance + (1 - self.decay_factor) * (ret ** 2)
-            
-            # Assuming ~1s updates on average. 31,536,000 seconds in a year
+            if (
+                exchange_ts_ms is not None
+                and self.last_spot_ts_ms is not None
+                and exchange_ts_ms > self.last_spot_ts_ms
+            ):
+                dt_sec = max(0.001, (exchange_ts_ms - self.last_spot_ts_ms) / 1000.0)
+            else:
+                dt_sec = 1.0
+
+            lam = max(0.0, min(0.999999, self._lambda_for_dt(dt_sec)))
+            self.variance = lam * self.variance + (1 - lam) * (ret ** 2)
+             
+            # Annualize from per-sample variance (dt handled in lambda, not in scaling term).
             self.sigma = math.sqrt(self.variance * 31536000)
             self.samples_collected += 1
-            
+             
         self.last_spot = price
+        if exchange_ts_ms is not None:
+            self.last_spot_ts_ms = exchange_ts_ms
         return self.sigma
 
     def compute_fair_values(self, spot: float, strikes: List[float], tte_years: float) -> List[FairValueResult]:

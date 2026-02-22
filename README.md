@@ -43,6 +43,8 @@ Event-driven Python MVP for a prediction-market maker simulation:
 - `WARMUP_SAMPLES` (default: `300`)
 - `KALSHI_HEARTBEAT_MS` (default: `30000`)
 - `HEALTH_STALE_SEC` (optional dashboard threshold; defaults to `ceil(KALSHI_HEARTBEAT_MS/1000)`)
+- `VOL_HALF_LIFE_SEC` (default: `300`, EWMA half-life in seconds for volatility smoothing)
+- `EWMA_DECAY_FACTOR` (optional fixed lambda override; if set, half-life setting is ignored)
 - `RISK_AUTO_RECOVER_MS` (default: `10000`, auto-clear recoverable risk-off after healthy feeds)
 - `MIN_QUOTE_TTE_MS` (default: `180000`, 3 minutes)
 - `DEAD_MARKET_FAILOVER_ENABLED` (default: `true`)
@@ -89,8 +91,10 @@ streamlit run dashboard/app.py
 - `data_warehouse/spot/...`
 - `data_warehouse/trade/...`
 - `data_warehouse/paper_fill/...`
+- `data_warehouse/quote_audit/...`
 - `data_warehouse/orderbook_delta/...`
 - `data_warehouse/lifecycle/...`
+- `data_warehouse/market_meta/...`
 - `data_warehouse/runtime/status.json` (startup run config used by dashboard health panel)
 
 ## Research Utilities

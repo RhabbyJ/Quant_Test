@@ -22,7 +22,8 @@ class BufferedParquetWriter:
             "lifecycle": [],
             "market_meta": [],
             "spot": [],
-            "paper_fill": []
+            "paper_fill": [],
+            "quote_audit": [],
         }
         self.last_flush_time = time.time()
         self._lock = asyncio.Lock()

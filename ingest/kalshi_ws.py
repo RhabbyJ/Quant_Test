@@ -232,6 +232,100 @@ class KalshiWSConsumer:
 
         return normalized
 
+    @staticmethod
+    def _to_float(raw: Any) -> Optional[float]:
+        if raw is None:
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _contract_from_ticker_suffix(self, ticker: str) -> tuple[Optional[str], Optional[float], Optional[float]]:
+        import re
+
+        m = re.search(r"(?:-|^)([TB])(\d+(?:\.\d+)?)$", ticker)
+        if not m:
+            return None, None, None
+        try:
+            strike = float(m.group(2))
+        except ValueError:
+            return None, None, None
+        direction = "below" if m.group(1) == "B" else "above"
+        return direction, strike, strike
+
+    def _parse_contract_spec(self, ticker: str, market: dict[str, Any]) -> tuple[Optional[str], Optional[float], Optional[float]]:
+        strike_low = self._to_float(
+            market.get("floor_strike")
+            or market.get("floor_strike_fp")
+            or market.get("strike_low")
+            or market.get("min_strike")
+        )
+        strike_high = self._to_float(
+            market.get("cap_strike")
+            or market.get("cap_strike_fp")
+            or market.get("strike_high")
+            or market.get("max_strike")
+        )
+        strike = self._to_float(market.get("strike") or market.get("strike_fp"))
+        if strike is not None:
+            strike_low = strike if strike_low is None else strike_low
+            strike_high = strike if strike_high is None else strike_high
+
+        strike_type = str(market.get("strike_type") or "").strip().lower()
+        direction = None
+        if strike_type in {"below", "under", "lt", "less_than"}:
+            direction = "below"
+        elif strike_type in {"above", "over", "gt", "greater_than", "threshold"}:
+            direction = "above"
+        elif strike_type in {"between", "range"}:
+            direction = "range"
+
+        if direction is None:
+            text = " ".join(
+                str(market.get(k, "")).lower()
+                for k in (
+                    "subtitle",
+                    "yes_sub_title",
+                    "yes_subtitle",
+                    "title",
+                    "yes_title",
+                    "condition",
+                    "rules_primary",
+                )
+            )
+            if any(tok in text for tok in (" below ", " less than ", " under ", " at or below ")):
+                direction = "below"
+            elif any(tok in text for tok in (" above ", " greater than ", " over ", " at or above ")):
+                direction = "above"
+            elif any(tok in text for tok in (" between ", " range ", " to ")):
+                direction = "range"
+
+        if direction is None:
+            suffix_dir, suffix_low, suffix_high = self._contract_from_ticker_suffix(ticker)
+            direction = suffix_dir
+            if strike_low is None:
+                strike_low = suffix_low
+            if strike_high is None:
+                strike_high = suffix_high
+
+        return direction, strike_low, strike_high
+
+    @staticmethod
+    def _parse_settlement_window(market: dict[str, Any]) -> Optional[str]:
+        parts = []
+        for key in (
+            "settlement_time",
+            "settlement_window",
+            "expected_expiration_time",
+            "expiration_time",
+            "close_time",
+        ):
+            val = market.get(key)
+            if val:
+                parts.append(f"{key}={val}")
+        return "; ".join(parts) if parts else None
+
     async def _enqueue_snapshot(self, ticker: str, yes_bids, no_bids, ts_ms: int):
         event = OrderbookSnapshotEvent(
             exchange_ts=ts_ms,
@@ -242,13 +336,27 @@ class KalshiWSConsumer:
         )
         await self.event_queue.put(event)
 
-    async def _enqueue_market_meta(self, ticker: str, close_ts: int, status: Optional[str], ts_ms: int):
+    async def _enqueue_market_meta(
+        self,
+        ticker: str,
+        close_ts: int,
+        status: Optional[str],
+        ts_ms: int,
+        direction: Optional[str] = None,
+        strike_low: Optional[float] = None,
+        strike_high: Optional[float] = None,
+        settlement_window: Optional[str] = None,
+    ):
         event = MarketMetadataEvent(
             exchange_ts=ts_ms,
             ingest_ts=int(time.time() * 1000),
             ticker=ticker,
             close_ts=close_ts,
             status=status,
+            direction=direction,
+            strike_low=strike_low,
+            strike_high=strike_high,
+            settlement_window=settlement_window,
         )
         await self.event_queue.put(event)
 
@@ -301,7 +409,18 @@ class KalshiWSConsumer:
 
             status = str(market.get("status", "")).lower() or None
             ts_ms = self._parse_exchange_ts_ms(market.get("updated_time"), ingest_ts)
-            await self._enqueue_market_meta(ticker, close_ts, status, ts_ms)
+            direction, strike_low, strike_high = self._parse_contract_spec(ticker=ticker, market=market)
+            settlement_window = self._parse_settlement_window(market)
+            await self._enqueue_market_meta(
+                ticker=ticker,
+                close_ts=close_ts,
+                status=status,
+                ts_ms=ts_ms,
+                direction=direction,
+                strike_low=strike_low,
+                strike_high=strike_high,
+                settlement_window=settlement_window,
+            )
             return True
         except Exception as e:
             logging.error("Error fetching market metadata for %s: %s", ticker, e)
@@ -312,7 +431,17 @@ class KalshiWSConsumer:
         yes_bids = [(49, 50), (48, 30), (47, 20)]
         no_bids = [(49, 50), (48, 30), (47, 20)]
         await self._enqueue_snapshot(ticker, yes_bids, no_bids, ts)
-        await self._enqueue_market_meta(ticker, ts + (24 * 3600 * 1000), "open", ts)
+        direction, strike_low, strike_high = self._contract_from_ticker_suffix(ticker)
+        await self._enqueue_market_meta(
+            ticker=ticker,
+            close_ts=ts + (24 * 3600 * 1000),
+            status="open",
+            ts_ms=ts,
+            direction=direction,
+            strike_low=strike_low,
+            strike_high=strike_high,
+            settlement_window=None,
+        )
         logging.warning("Seeded synthetic snapshot for %s", ticker)
 
     async def _run_synthetic(self):
@@ -604,4 +733,15 @@ class KalshiWSConsumer:
             close_raw = payload.get("close_time") or payload.get("close_ts") or payload.get("expiration_time")
             close_ts = self._parse_exchange_ts_ms(close_raw, 0)
             if close_ts > 0:
-                await self._enqueue_market_meta(ticker, close_ts, status, ts_ms)
+                direction, strike_low, strike_high = self._parse_contract_spec(ticker=ticker, market=payload)
+                settlement_window = self._parse_settlement_window(payload)
+                await self._enqueue_market_meta(
+                    ticker=ticker,
+                    close_ts=close_ts,
+                    status=status,
+                    ts_ms=ts_ms,
+                    direction=direction,
+                    strike_low=strike_low,
+                    strike_high=strike_high,
+                    settlement_window=settlement_window,
+                )

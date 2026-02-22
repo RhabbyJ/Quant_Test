@@ -8,6 +8,14 @@ class Quote:
     yes_bid_cents: int
     no_bid_cents: int
     size: int
+    fair_prob: float
+    sigma: float
+    tte_years: float
+    sigma_t: float
+    inventory: int
+    inventory_skew: float
+    half_spread_cents: int
+    fee_widen_steps: int
 
 class Quoter:
     """
@@ -41,8 +49,17 @@ class Quoter:
         # Convert to cents and apply ceiling
         return math.ceil(fee_dollars * 100)
 
-    def generate_quote(self, ticker: str, fair_prob: float, spot: float, strike: float,
-                       current_time_ms: int, vol: float, quote_size: int = 10) -> Optional[Quote]:
+    def generate_quote(
+        self,
+        ticker: str,
+        fair_prob: float,
+        spot: float,
+        strike: float,
+        current_time_ms: int,
+        vol: float,
+        quote_size: int = 10,
+        tte_years: float | None = None,
+    ) -> Optional[Quote]:
         """
         Guardrail #5 constraints applied: Only quote if strike is near ATM.
         Guardrail #8 constraints applied: Throttle updates to avoid cancellation storms.
@@ -59,9 +76,13 @@ class Quoter:
         skewed_prob = fair_prob - inventory_skew
         skewed_cents = round(skewed_prob * 100)
         
-        # Volatility-based spread widening
-        # Base spread 1 cent, widened heavily by high volatility
-        half_spread_cents = max(1, round(vol * self.vol_spread_mult))
+        # Volatility + time-to-expiry based spread widening.
+        # Use sigma*sqrt(T) as the key uncertainty scaler.
+        if tte_years is None or tte_years <= 0:
+            sigma_t = max(0.0, vol)
+        else:
+            sigma_t = max(0.0, vol * math.sqrt(max(0.0, tte_years)))
+        half_spread_cents = max(1, min(25, round(sigma_t * self.vol_spread_mult * 10.0)))
         
         yes_bid = skewed_cents - half_spread_cents
         yes_ask = skewed_cents + half_spread_cents
@@ -76,18 +97,25 @@ class Quoter:
         fee_bid = self.get_maker_fee_cents(yes_bid, quote_size)
         fee_ask = self.get_maker_fee_cents(yes_ask, quote_size)
         
-        # Expected gross edge minus fees
-        if (yes_ask - yes_bid) * quote_size <= (fee_bid + fee_ask):
-            yes_ask += 1
-            yes_bid -= 1
-            yes_bid = max(1, yes_bid)
-            yes_ask = min(99, yes_ask)
-             
-        # If it still doesn't clear (due to clamping), we refuse to quote.
-        fee_bid = self.get_maker_fee_cents(yes_bid, quote_size)
-        fee_ask = self.get_maker_fee_cents(yes_ask, quote_size)
-        if (yes_ask - yes_bid) * quote_size <= (fee_bid + fee_ask):
-            return None 
+        # Iteratively widen until edge clears maker fees or we hit bounds.
+        iterations = 0
+        while (yes_ask - yes_bid) * quote_size <= (fee_bid + fee_ask):
+            widened = False
+            if yes_bid > 1:
+                yes_bid -= 1
+                widened = True
+            if yes_ask < 99:
+                yes_ask += 1
+                widened = True
+            if not widened:
+                return None
+            if yes_bid >= yes_ask:
+                yes_bid = max(1, yes_ask - 1)
+            fee_bid = self.get_maker_fee_cents(yes_bid, quote_size)
+            fee_ask = self.get_maker_fee_cents(yes_ask, quote_size)
+            iterations += 1
+            if iterations > 200:
+                return None
 
         # Kalshi bids-only representation:
         # sell YES leg is posted as NO bid complement of YES ask.
@@ -105,7 +133,20 @@ class Quoter:
         if last_quote and last_quote.yes_bid_cents == yes_bid and last_quote.no_bid_cents == no_bid:
             return last_quote
 
-        quote = Quote(ticker, yes_bid, no_bid, quote_size)
+        quote = Quote(
+            ticker=ticker,
+            yes_bid_cents=yes_bid,
+            no_bid_cents=no_bid,
+            size=quote_size,
+            fair_prob=fair_prob,
+            sigma=vol,
+            tte_years=max(0.0, float(tte_years or 0.0)),
+            sigma_t=sigma_t,
+            inventory=net_pos,
+            inventory_skew=inventory_skew,
+            half_spread_cents=half_spread_cents,
+            fee_widen_steps=iterations,
+        )
         self.last_quotes[ticker] = quote
         self.last_quote_time[ticker] = current_time_ms
         return quote

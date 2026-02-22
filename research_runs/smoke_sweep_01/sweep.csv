@@ -1,0 +1,5 @@
+vol_spread_mult,min_quote_lifetime_ms,events_processed,fills,fill_contracts,final_net_yes,tickers,avg_time_since_quote_ms
+4,500,246,0,0,0,KXBTC-26FEB2117-B68750,
+4,1000,246,0,0,0,KXBTC-26FEB2117-B68750,
+6,500,246,0,0,0,KXBTC-26FEB2117-B68750,
+6,1000,246,0,0,0,KXBTC-26FEB2117-B68750,
