@@ -1,0 +1,20 @@
+base_run=overnight_analysis candidate_run=overnight_v2_replay type=replay
+
+## Summary Metric Delta
+          metric        base   candidate  delta
+events_processed 1.30807e+06 1.75687e+06 448800
+  fill_contracts           0           0      0
+           fills           0           0      0
+   final_net_yes           0           0      0
+
+## Fill Metric Delta
+                 metric base candidate delta
+avg_time_since_quote_ms  NaN       NaN   NaN
+         fill_contracts    0         0     0
+                  fills    0         0     0
+
+## Markout By Horizon
+(no rows)
+
+## Config Differences
+(no rows)

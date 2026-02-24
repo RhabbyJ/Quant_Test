@@ -154,23 +154,48 @@ def _fetch_open_markets(
     return all_markets
 
 
-def discover_kxbtc_tickers(
+def discover_tickers(
     rest_base_url: str,
-    series_ticker: str = "KXBTC",
+    series_tickers: Optional[List[str]] = None,
     desired_count: int = 3,
     min_close_min: int = 30,
     max_close_min: int = 180,
+    min_runway_sec: int = 0,
     reference_spot: Optional[float] = None,
     max_pages: int = 6,
+    # Legacy single-series param for backward compat
+    series_ticker: Optional[str] = None,
 ) -> DiscoveryResult:
+    """Multi-family discovery with runway constraint.
+
+    Args:
+        series_tickers: List of product families to search, e.g. ["KXBTC", "KXETH"].
+        min_runway_sec: Minimum TTE in seconds. Overrides min_close_min if larger.
+        Other args: same as before.
+    """
+    # Resolve family list
+    families = series_tickers or ([series_ticker] if series_ticker else ["KXBTC"])
+
+    # Enforce runway constraint as a floor on min_close_min
+    if min_runway_sec > 0:
+        runway_min = int(math.ceil(min_runway_sec / 60.0))
+        min_close_min = max(min_close_min, runway_min)
+
     now_ms = int(time.time() * 1000)
     min_close_ms = now_ms + (min_close_min * 60 * 1000)
     max_close_ms = now_ms + (max_close_min * 60 * 1000)
 
-    markets = _fetch_open_markets(rest_base_url, series_ticker, max_pages=max_pages)
+    # Fetch across all product families
+    all_markets: List[Dict[str, Any]] = []
+    for family in families:
+        try:
+            all_markets.extend(_fetch_open_markets(rest_base_url, family, max_pages=max_pages))
+        except Exception:
+            pass  # Skip unreachable families
+
     candidates: List[DiscoveredMarket] = []
 
-    for market in markets:
+    for market in all_markets:
         ticker = str(market.get("ticker") or market.get("market_ticker") or "")
         if not ticker:
             continue
@@ -213,7 +238,6 @@ def discover_kxbtc_tickers(
     chosen_close_ts, ladder = ranked_closes[0]
 
     if reference_spot is None or reference_spot <= 0:
-        # Fallback to ladder median strike if no external reference spot is supplied.
         reference_spot = median([m.strike for m in ladder])
 
     def moneyness_distance(m: DiscoveredMarket) -> float:
@@ -230,4 +254,25 @@ def discover_kxbtc_tickers(
         reference_spot=reference_spot,
         selected=selected,
         total_candidates=len(candidates),
+    )
+
+
+# Backward-compatible alias
+def discover_kxbtc_tickers(
+    rest_base_url: str,
+    series_ticker: str = "KXBTC",
+    desired_count: int = 3,
+    min_close_min: int = 30,
+    max_close_min: int = 180,
+    reference_spot: Optional[float] = None,
+    max_pages: int = 6,
+) -> DiscoveryResult:
+    return discover_tickers(
+        rest_base_url=rest_base_url,
+        series_tickers=[series_ticker],
+        desired_count=desired_count,
+        min_close_min=min_close_min,
+        max_close_min=max_close_min,
+        reference_spot=reference_spot,
+        max_pages=max_pages,
     )

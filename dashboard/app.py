@@ -5,6 +5,7 @@ import glob
 import json
 import logging
 import os
+import random
 from pathlib import Path
 
 from research.markouts import compute_fill_markouts, normalize_side
@@ -106,6 +107,7 @@ def fetch_data():
     fill_files = [p.replace("\\", "/") for p in glob.glob("data_warehouse/paper_fill/**/*.parquet", recursive=True)]
     meta_files = [p.replace("\\", "/") for p in glob.glob("data_warehouse/market_meta/**/*.parquet", recursive=True)]
     audit_files = [p.replace("\\", "/") for p in glob.glob("data_warehouse/quote_audit/**/*.parquet", recursive=True)]
+    edge_files = [p.replace("\\", "/") for p in glob.glob("data_warehouse/edge_metric/**/*.parquet", recursive=True)]
 
     spot_df = _read_channel(con, "spot", spot_files, 1000)
     trade_df = _read_channel(con, "trade", trade_files, 500)
@@ -113,8 +115,41 @@ def fetch_data():
     fill_df = _read_channel(con, "paper_fill", fill_files, 500)
     meta_df = _read_channel(con, "market_meta", meta_files, 500)
     audit_df = _read_channel(con, "quote_audit", audit_files, 500)
+    edge_df = _read_channel(con, "edge_metric", edge_files, 1000)
 
-    return spot_df, trade_df, ob_df, fill_df, meta_df, audit_df
+    return spot_df, trade_df, ob_df, fill_df, meta_df, audit_df, edge_df
+
+
+def _mean_ci95(series: pd.Series) -> tuple[float, float]:
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return float("nan"), float("nan")
+    mean = float(values.mean())
+    if len(values) < 2:
+        return mean, float("nan")
+    std = float(values.std(ddof=1))
+    ci_half = 1.96 * std / max(1.0, (len(values) ** 0.5))
+    return mean, ci_half
+
+
+def _bootstrap_ci95(series: pd.Series, samples: int = 300, seed: int = 0) -> tuple[float, float]:
+    values = pd.to_numeric(series, errors="coerce").dropna().tolist()
+    if not values:
+        return float("nan"), float("nan")
+    if len(values) < 2:
+        v = float(values[0])
+        return v, v
+    rng = random.Random(seed + len(values))
+    n = len(values)
+    means = []
+    draws = max(50, int(samples))
+    for _ in range(draws):
+        sample_mean = sum(values[rng.randrange(n)] for __ in range(n)) / n
+        means.append(sample_mean)
+    means.sort()
+    lo = means[int(0.025 * (len(means) - 1))]
+    hi = means[int(0.975 * (len(means) - 1))]
+    return float(lo), float(hi)
 
 
 def _latest_exchange_ts_ms(df: pd.DataFrame) -> int | None:
@@ -196,15 +231,27 @@ def _render_health_panel(spot_df: pd.DataFrame, trade_df: pd.DataFrame, ob_df: p
             f"health_stale_sec={runtime.get('health_stale_sec','n/a')} "
             f"vol_half_life_sec={runtime.get('vol_half_life_sec','n/a')} "
             f"ewma_decay_factor={runtime.get('ewma_decay_factor','n/a')} "
+            f"vol_spread_mult={runtime.get('vol_spread_mult','n/a')} "
+            f"quote_size={runtime.get('quote_size','n/a')} "
+            f"edge_horizon_ms={runtime.get('edge_horizon_ms','n/a')} "
+            f"spread_gov_window={runtime.get('spread_governor_window_fills','n/a')} "
+            f"spread_gov_min_fills={runtime.get('spread_governor_min_fills','n/a')} "
+            f"profit_kpi_min_fills={runtime.get('profit_kpi_min_fills','n/a')} "
+            f"market_rank={runtime.get('market_rank_enabled','n/a')} "
+            f"realism={runtime.get('paper_realism_mode','n/a')} "
             f"risk_auto_recover_ms={runtime.get('risk_auto_recover_ms','n/a')} "
             f"min_quote_tte_ms={runtime.get('min_quote_tte_ms','n/a')} "
+            f"market_min_trades_hr={runtime.get('market_min_trades_per_hour','n/a')} "
+            f"market_min_top_depth={runtime.get('market_min_top_depth','n/a')} "
             f"dead_failover={runtime.get('dead_market_failover_enabled', False)} "
+            f"fixed_ladder={runtime.get('research_fixed_ladder', False)} "
             f"tickers={tickers_str}"
         )
 
 
 def _render_live_panels(show_mock_spot: bool):
-    spot_df, trade_df, ob_df, fill_df, meta_df, audit_df = fetch_data()
+    spot_df, trade_df, ob_df, fill_df, meta_df, audit_df, edge_df = fetch_data()
+    runtime = _load_runtime_status()
     _render_health_panel(spot_df, trade_df, ob_df)
 
     st.subheader("Contract Specs (Exchange Metadata)")
@@ -215,7 +262,21 @@ def _render_live_panels(show_mock_spot: bool):
         specs = specs.sort_values("exchange_ts", ascending=False).drop_duplicates(subset=["ticker"], keep="first")
         if "close_ts" in specs.columns:
             specs["close_time_utc"] = pd.to_datetime(pd.to_numeric(specs["close_ts"], errors="coerce"), unit="ms", utc=True)
-        cols = [c for c in ["ticker", "direction", "strike_low", "strike_high", "close_time_utc", "settlement_window"] if c in specs.columns]
+        cols = [
+            c
+            for c in [
+                "ticker",
+                "direction",
+                "strike_low",
+                "strike_high",
+                "close_time_utc",
+                "settlement_window",
+                "oracle_risk_score",
+                "oracle_blocked",
+                "oracle_reason",
+            ]
+            if c in specs.columns
+        ]
         st.dataframe(specs[cols].head(20))
     else:
         st.info("No market metadata rows yet.")
@@ -384,6 +445,119 @@ def _render_live_panels(show_mock_spot: bool):
                     if calib_horizon is not None:
                         st.caption(f"Calibration horizon: {int(calib_horizon)}s")
                     st.dataframe(by_bin)
+
+    st.subheader("Fee-Adjusted Edge (Profit Compass)")
+    st.caption("Per-contract: signed_markout(horizon) - maker_fee - slippage_buffer")
+    if not edge_df.empty:
+        edge = edge_df.copy()
+        edge["exchange_ts"] = pd.to_numeric(edge["exchange_ts"], errors="coerce")
+        edge["fee_adjusted_edge_cents"] = pd.to_numeric(edge["fee_adjusted_edge_cents"], errors="coerce")
+        edge["signed_markout_cents"] = pd.to_numeric(edge["signed_markout_cents"], errors="coerce")
+        edge["maker_fee_cents_per_contract"] = pd.to_numeric(edge["maker_fee_cents_per_contract"], errors="coerce")
+        edge = edge.dropna(subset=["exchange_ts", "fee_adjusted_edge_cents"])
+        edge = edge.sort_values("exchange_ts")
+        edge["Time"] = pd.to_datetime(edge["exchange_ts"], unit="ms", utc=True)
+
+        mean_edge, ci_half = _mean_ci95(edge["fee_adjusted_edge_cents"])
+        lcb, ucb = _bootstrap_ci95(edge["fee_adjusted_edge_cents"], samples=300, seed=42)
+        min_fills_gate = int(runtime.get("profit_kpi_min_fills", runtime.get("spread_governor_min_fills", 50)))
+        gate_pass = (len(edge) >= min_fills_gate) and pd.notna(lcb) and (lcb > 0.0)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Mean Fee-Adj Edge", f"{mean_edge:.3f}c")
+        c2.metric("95% CI Half-Width", f"{ci_half:.3f}c" if pd.notna(ci_half) else "n/a")
+        c3.metric("Samples", f"{len(edge)}")
+        c4, c5, c6 = st.columns(3)
+        c4.metric("Bootstrap LCB", f"{lcb:.3f}c" if pd.notna(lcb) else "n/a")
+        c5.metric("Bootstrap UCB", f"{ucb:.3f}c" if pd.notna(ucb) else "n/a")
+        c6.metric("Profit Gate", "PASS" if gate_pass else "FAIL")
+
+        if "fill_size" in edge.columns:
+            edge["fill_size"] = pd.to_numeric(edge["fill_size"], errors="coerce").fillna(0.0)
+            span_ms = max(1.0, float(edge["exchange_ts"].max() - edge["exchange_ts"].min()))
+            fills_per_hour = len(edge) * (3600000.0 / span_ms)
+            avg_fill_size = float(edge["fill_size"].mean()) if len(edge) > 0 else 0.0
+            expected_edge_per_hour_cents = mean_edge * fills_per_hour * avg_fill_size
+            expected_edge_per_hour_usd = expected_edge_per_hour_cents / 100.0
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Fills / Hour", f"{fills_per_hour:.2f}")
+            p2.metric("Avg Fill Size", f"{avg_fill_size:.2f}")
+            p3.metric("Expected Edge / Hour", f"${expected_edge_per_hour_usd:.2f}")
+
+        by_side = (
+            edge.groupby("side", as_index=False)
+            .agg(
+                samples=("fee_adjusted_edge_cents", "count"),
+                mean_fee_adj_edge_cents=("fee_adjusted_edge_cents", "mean"),
+                mean_signed_markout_cents=("signed_markout_cents", "mean"),
+                mean_fee_cents=("maker_fee_cents_per_contract", "mean"),
+            )
+            .sort_values("samples", ascending=False)
+        )
+        st.dataframe(by_side)
+
+        by_ticker = (
+            edge.groupby("ticker", as_index=False)
+            .agg(
+                samples=("fee_adjusted_edge_cents", "count"),
+                mean_fee_adj_edge_cents=("fee_adjusted_edge_cents", "mean"),
+                std_fee_adj_edge_cents=("fee_adjusted_edge_cents", "std"),
+            )
+            .sort_values("mean_fee_adj_edge_cents", ascending=False)
+        )
+        st.dataframe(by_ticker.head(20))
+
+        if "sigma_at_quote" in edge.columns:
+            edge["sigma_at_quote"] = pd.to_numeric(edge["sigma_at_quote"], errors="coerce")
+            sigma_vals = edge["sigma_at_quote"].dropna()
+            if len(sigma_vals) >= 10:
+                q1, q2 = sigma_vals.quantile([0.33, 0.66]).tolist()
+                edge["vol_regime"] = pd.cut(
+                    edge["sigma_at_quote"],
+                    bins=[-float("inf"), q1, q2, float("inf")],
+                    labels=["low_vol", "mid_vol", "high_vol"],
+                )
+                vol_summary = (
+                    edge.groupby("vol_regime", observed=False, as_index=False)
+                    .agg(
+                        samples=("fee_adjusted_edge_cents", "count"),
+                        mean_fee_adj_edge_cents=("fee_adjusted_edge_cents", "mean"),
+                    )
+                )
+                st.dataframe(vol_summary)
+
+        if "tte_ms_at_quote" in edge.columns:
+            edge["tte_ms_at_quote"] = pd.to_numeric(edge["tte_ms_at_quote"], errors="coerce")
+            edge["tte_min"] = edge["tte_ms_at_quote"] / 60000.0
+            edge["expiry_window"] = pd.cut(
+                edge["tte_min"],
+                bins=[-float("inf"), 15, 60, 180, float("inf")],
+                labels=["<15m", "15-60m", "60-180m", ">180m"],
+            )
+            expiry_summary = (
+                edge.groupby("expiry_window", observed=False, as_index=False)
+                .agg(
+                    samples=("fee_adjusted_edge_cents", "count"),
+                    mean_fee_adj_edge_cents=("fee_adjusted_edge_cents", "mean"),
+                )
+            )
+            st.dataframe(expiry_summary)
+
+        show_cols = [
+            "Time",
+            "ticker",
+            "side",
+            "horizon_s",
+            "signed_markout_cents",
+            "maker_fee_cents_per_contract",
+            "slippage_buffer_cents",
+            "fee_adjusted_edge_cents",
+            "sigma_at_quote",
+            "tte_ms_at_quote",
+        ]
+        show_cols = [c for c in show_cols if c in edge.columns]
+        st.dataframe(edge[show_cols].tail(50).sort_values("Time", ascending=False))
+    else:
+        st.info("No edge samples yet. Need fills + horizon markout data.")
 
     st.subheader("Quote Decision Audit (Why We Quoted Here)")
     if not audit_df.empty:

@@ -107,6 +107,8 @@ def persist_sweep_results(
 
 
 def _is_nan(val: Any) -> bool:
+    if pd.isna(val):
+        return True
     try:
         return bool(math.isnan(val))
     except Exception:
@@ -197,6 +199,13 @@ def _build_replay_events(data: dict[str, pd.DataFrame]) -> list[tuple[int, int, 
                     strike_low=_to_float(row.get("strike_low")) if "strike_low" in row else None,
                     strike_high=_to_float(row.get("strike_high")) if "strike_high" in row else None,
                     settlement_window=str(row.get("settlement_window", "")) or None,
+                    oracle_risk_score=_to_float(row.get("oracle_risk_score")) if "oracle_risk_score" in row else None,
+                    oracle_blocked=(
+                        None
+                        if ("oracle_blocked" not in row or _is_nan(row.get("oracle_blocked")))
+                        else bool(row.get("oracle_blocked"))
+                    ),
+                    oracle_reason=str(row.get("oracle_reason", "")) or None,
                 ),
             )
         )
@@ -313,6 +322,8 @@ def _summarize(
     engine: EngineLoop,
     fills_df: pd.DataFrame,
     markouts_df: pd.DataFrame,
+    edge_df: pd.DataFrame,
+    quote_audit_df: pd.DataFrame,
 ) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "events_processed": 0,
@@ -340,6 +351,41 @@ def _summarize(
             summary[f"markout_{int(horizon)}s_count"] = int(len(subset))
             summary[f"markout_{int(horizon)}s_avg_cents"] = float(subset["markout_cents"].mean())
             summary[f"markout_{int(horizon)}s_total_usd"] = float(subset["markout_usd"].sum())
+            if "fee_adjusted_edge_cents" in subset.columns:
+                summary[f"fee_adjusted_edge_{int(horizon)}s_avg_cents"] = float(subset["fee_adjusted_edge_cents"].mean())
+                summary[f"fee_adjusted_edge_{int(horizon)}s_total_cents"] = float(subset["fee_adjusted_edge_cents"].sum())
+
+    if not edge_df.empty:
+        tmp = edge_df.copy()
+        tmp["exchange_ts"] = pd.to_numeric(tmp.get("exchange_ts"), errors="coerce")
+        tmp["fee_adjusted_edge_cents"] = pd.to_numeric(tmp.get("fee_adjusted_edge_cents"), errors="coerce")
+        tmp["signed_markout_cents"] = pd.to_numeric(tmp.get("signed_markout_cents"), errors="coerce")
+        tmp["fill_size"] = pd.to_numeric(tmp.get("fill_size"), errors="coerce")
+        tmp = tmp.dropna(subset=["exchange_ts", "fee_adjusted_edge_cents"])
+        if not tmp.empty:
+            summary["edge_samples"] = int(len(tmp))
+            summary["edge_mean_cents"] = float(tmp["fee_adjusted_edge_cents"].mean())
+            if len(tmp) >= 2:
+                summary["edge_std_cents"] = float(tmp["fee_adjusted_edge_cents"].std(ddof=1))
+                summary["edge_ci95_half_cents"] = float(1.96 * summary["edge_std_cents"] / math.sqrt(len(tmp)))
+            else:
+                summary["edge_std_cents"] = float("nan")
+                summary["edge_ci95_half_cents"] = float("nan")
+            span_ms = max(1.0, float(tmp["exchange_ts"].max() - tmp["exchange_ts"].min()))
+            fills_per_hour = len(tmp) * (3600000.0 / span_ms)
+            avg_fill_size = float(tmp["fill_size"].dropna().mean()) if tmp["fill_size"].notna().any() else 0.0
+            edge_per_hour_cents = summary["edge_mean_cents"] * fills_per_hour * avg_fill_size
+            summary["fills_per_hour"] = float(fills_per_hour)
+            summary["avg_fill_size"] = float(avg_fill_size)
+            summary["edge_per_hour_cents"] = float(edge_per_hour_cents)
+            summary["edge_per_hour_usd"] = float(edge_per_hour_cents / 100.0)
+            mean_signed_markout = float(tmp["signed_markout_cents"].dropna().mean()) if tmp["signed_markout_cents"].notna().any() else float("nan")
+            summary["toxicity"] = float((-mean_signed_markout) * (fills_per_hour / 60.0)) if not math.isnan(mean_signed_markout) else float("nan")
+
+    if not quote_audit_df.empty and "inventory" in quote_audit_df.columns:
+        inv = pd.to_numeric(quote_audit_df["inventory"], errors="coerce").dropna()
+        if not inv.empty:
+            summary["inventory_variance"] = float(inv.var(ddof=1)) if len(inv) > 1 else 0.0
     return summary
 
 
@@ -363,12 +409,21 @@ async def _run_replay_on_loaded_data(cfg: ReplayConfig, data: dict[str, pd.DataF
 
         await engine._apply_exchange_events(batch)
         await engine._resolve_paper_fills(batch)
-        engine._run_strategy_tick(ts)
+        await engine._run_strategy_tick(ts)
 
     fills_df = store.to_df("paper_fill")
     ob_df = data.get("orderbook_delta", pd.DataFrame())
     markouts_df = compute_fill_markouts(fill_df=fills_df, ob_df=ob_df)
-    summary = _summarize(cfg=cfg, engine=engine, fills_df=fills_df, markouts_df=markouts_df)
+    edge_df = store.to_df("edge_metric")
+    quote_audit_df = store.to_df("quote_audit")
+    summary = _summarize(
+        cfg=cfg,
+        engine=engine,
+        fills_df=fills_df,
+        markouts_df=markouts_df,
+        edge_df=edge_df,
+        quote_audit_df=quote_audit_df,
+    )
     summary["events_processed"] = len(replay_events)
     return ReplayResult(config=cfg, summary=summary, fills_df=fills_df, markouts_df=markouts_df)
 

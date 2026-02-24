@@ -108,6 +108,8 @@ class Quoter:
                 yes_ask += 1
                 widened = True
             if not widened:
+                import logging
+                logging.error(f"Quoter reject {ticker}: Cannot widen anymore. diff={(yes_ask - yes_bid) * quote_size} fees={fee_bid + fee_ask}")
                 return None
             if yes_bid >= yes_ask:
                 yes_bid = max(1, yes_ask - 1)
@@ -115,6 +117,8 @@ class Quoter:
             fee_ask = self.get_maker_fee_cents(yes_ask, quote_size)
             iterations += 1
             if iterations > 200:
+                import logging
+                logging.error(f"Quoter reject {ticker}: iterations > 200")
                 return None
 
         # Kalshi bids-only representation:

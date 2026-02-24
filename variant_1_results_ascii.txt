@@ -1,0 +1,85 @@
+  (skipped 159 corrupt files out of 6022)
+  (skipped 6 corrupt files out of 31125)
+============================================================
+OVERNIGHT PRODUCTION DATA ANALYSIS
+============================================================
+
+--- DATA VOLUME ---
+Trade events:     25,232
+Orderbook deltas: 1,727,150
+Paper fills:      197
+Parquet files:    171 fills, 6022 trades, 31125 ob
+
+--- TIME SPAN ---
+From: 2026-02-20 01:26:27.778000 UTC
+To:   2026-02-24 04:32:01 UTC
+Duration: 99.1 hours
+
+--- TRADE ANALYSIS ---
+Unique tickers traded: 58
+KXBTC trades: 7,315
+KXBTC tickers: 55
+Total volume (all): 3,263,747,714,481,950,128 contracts
+KXBTC volume: 371,190 contracts
+Avg trade size: 129349544803501.5 contracts
+Max trade size: 1735315311849439237 contracts
+
+--- PRICE DISTRIBUTION (KXBTC) ---
+  KXBTC-26FEB2102-B70125: 1028 trades, price 26-61c, vol 3071
+  KXBTC-26FEB2102-B70375: 1027 trades, price 37-64c, vol 3093
+  KXBTC-26FEB2102-B69875: 1027 trades, price 45-67c, vol 3073
+  KXBTC-26FEB2103-B69875: 2 trades, price 15-15c, vol 4
+  KXBTC-26FEB2103-B69375: 2 trades, price 17-17c, vol 4
+  KXBTC-26FEB2103-B69625: 2 trades, price 16-16c, vol 4
+  KXBTC-26FEB2104-B68125: 222 trades, price 4-99c, vol 13742
+  KXBTC-26FEB2104-B67875: 218 trades, price 2-93c, vol 11408
+  KXBTC-26FEB2104-B67625: 9 trades, price 1-7c, vol 280
+  KXBTC-26FEB2105-B68125: 129 trades, price 39-99c, vol 6733
+
+--- KXBTC TRADES BY HOUR (UTC) ---
+  00:00 UTC = 715 trades
+  01:00 UTC = 18 trades
+  03:00 UTC = 1 trades
+  04:00 UTC = 2 trades
+  05:00 UTC = 3086 trades
+  06:00 UTC = 4 trades
+  07:00 UTC = 6 trades
+  08:00 UTC = 530 trades
+  09:00 UTC = 397 trades
+  10:00 UTC = 67 trades
+  11:00 UTC = 53 trades
+  12:00 UTC = 19 trades
+  13:00 UTC = 32 trades
+  14:00 UTC = 42 trades
+  15:00 UTC = 40 trades
+  16:00 UTC = 34 trades
+  17:00 UTC = 30 trades
+  18:00 UTC = 24 trades
+  19:00 UTC = 82 trades
+  20:00 UTC = 183 trades
+  21:00 UTC = 378 trades
+  22:00 UTC = 686 trades
+  23:00 UTC = 886 trades
+
+--- PAPER FILL ANALYSIS ---
+Total fills: 197
+Total contracts filled: 671
+Side breakdown:
+side
+no_bid     100
+yes_bid     96
+Avg fill price: 50.1c
+Price range: 11-90c
+Tickers filled: ['T2', 'KXBTC-26FEB2102-B70375', 'KXBTC-26FEB2102-B69875', 'KXBTC-26FEB2102-B70125', 'KXBTC-26FEB2104-B68125', 'KXBTC-26FEB2105-B68125', 'KXBTC-26FEB2105-B68375', 'KXBTC-26FEB2117-B68250', 'KXBTC-26FEB2117-B67750', 'KXBTC-26FEB2117-B68750']
+Fill time span: 1970-01-01 00:00:00.002000 to 2026-02-21 21:21:44
+
+--- ORDERBOOK DELTA ANALYSIS ---
+Total deltas: 1,727,150
+Tickers with book data: 104
+Price range in books: 1-99c
+Avg delta size: 598.9
+Max delta size: 128116
+
+============================================================
+ANALYSIS COMPLETE
+============================================================

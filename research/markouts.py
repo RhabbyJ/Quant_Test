@@ -2,6 +2,7 @@ from bisect import bisect_left
 from typing import Iterable
 
 import pandas as pd
+import math
 
 
 def normalize_side(value) -> str:
@@ -97,6 +98,7 @@ def compute_fill_markouts(
     ob_df: pd.DataFrame,
     horizons_sec: Iterable[int] = (1, 10, 60),
     tolerance_ms_by_horizon: dict[int, int] | None = None,
+    slippage_buffer_cents: float = 0.20,
 ) -> pd.DataFrame:
     if fill_df.empty:
         return pd.DataFrame()
@@ -140,6 +142,9 @@ def compute_fill_markouts(
         fill_price = float(fill.price_cents)
         size = int(fill.size)
         fill_yes_price = fill_price if side == "yes_bid" else (100.0 - fill_price)
+        fee_dollars = 0.0175 * size * (fill_price / 100.0) * (1.0 - (fill_price / 100.0))
+        maker_fee_total_cents = float(math.ceil(fee_dollars * 100.0))
+        maker_fee_per_contract = maker_fee_total_cents / max(1, size)
         sign = 1.0 if side == "yes_bid" else -1.0
         fair_prob_at_quote = float(fill.fair_prob_at_quote) if hasattr(fill, "fair_prob_at_quote") and fill.fair_prob_at_quote is not None else None
         sigma_at_quote = float(fill.sigma_at_quote) if hasattr(fill, "sigma_at_quote") and fill.sigma_at_quote is not None else None
@@ -155,6 +160,7 @@ def compute_fill_markouts(
             mid_after = float(mid_list[mid_idx])
             mid_sample_ts = int(ts_list[mid_idx])
             markout_cents = sign * (mid_after - fill_yes_price)
+            fee_adjusted_edge = markout_cents - maker_fee_per_contract - float(slippage_buffer_cents)
             rows.append(
                 {
                     "ticker": ticker,
@@ -168,6 +174,9 @@ def compute_fill_markouts(
                     "realized_yes_prob": mid_after / 100.0,
                     "markout_cents": markout_cents,
                     "signed_markout_cents": markout_cents,
+                    "maker_fee_cents_per_contract": maker_fee_per_contract,
+                    "slippage_buffer_cents": float(slippage_buffer_cents),
+                    "fee_adjusted_edge_cents": fee_adjusted_edge,
                     "size": size,
                     "markout_usd": (markout_cents * size) / 100.0,
                     "fair_prob_at_quote": fair_prob_at_quote,

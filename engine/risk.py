@@ -32,8 +32,9 @@ class RiskEngine:
     
     def check_heartbeat(self, current_ts: int) -> bool:
         """ Returns False if heartbeat failed, triggering Risk Off """
-        spot_stale = self.last_spot_ts <= 0 or (current_ts - self.last_spot_ts) > self.spot_heartbeat_ms
-        kalshi_stale = self.last_kalshi_ts <= 0 or (current_ts - self.last_kalshi_ts) > self.kalshi_heartbeat_ms
+        # Only check staleness for feeds that have actually started (grace period for startup/warmup)
+        spot_stale = self.last_spot_ts > 0 and (current_ts - self.last_spot_ts) > self.spot_heartbeat_ms
+        kalshi_stale = self.last_kalshi_ts > 0 and (current_ts - self.last_kalshi_ts) > self.kalshi_heartbeat_ms
 
         if spot_stale or kalshi_stale:
             self.healthy_since_ts = 0

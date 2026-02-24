@@ -24,9 +24,11 @@ class BufferedParquetWriter:
             "spot": [],
             "paper_fill": [],
             "quote_audit": [],
+            "edge_metric": [],
         }
         self.last_flush_time = time.time()
         self._lock = asyncio.Lock()
+        self.write_counts: Dict[str, int] = {k: 0 for k in self.buffers.keys()}
         
         # Ensure directories exist
         for channel in self.buffers.keys():
@@ -91,5 +93,6 @@ class BufferedParquetWriter:
                 
                 # Clear buffer
                 self.buffers[channel] = []
+                self.write_counts[channel] += 1
                 
             self.last_flush_time = time.time()

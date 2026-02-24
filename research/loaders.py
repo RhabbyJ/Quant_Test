@@ -60,6 +60,7 @@ def load_default_channels(base_dir: str = "data_warehouse") -> dict[str, pd.Data
         "orderbook_delta": load_channel("orderbook_delta", base_dir=base_dir),
         "paper_fill": load_channel("paper_fill", base_dir=base_dir),
         "quote_audit": load_channel("quote_audit", base_dir=base_dir),
+        "edge_metric": load_channel("edge_metric", base_dir=base_dir),
         "lifecycle": load_channel("lifecycle", base_dir=base_dir),
         "market_meta": load_channel("market_meta", base_dir=base_dir),
     }

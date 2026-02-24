@@ -326,6 +326,54 @@ class KalshiWSConsumer:
                 parts.append(f"{key}={val}")
         return "; ".join(parts) if parts else None
 
+    @staticmethod
+    def _parse_oracle_risk(market: dict[str, Any]) -> tuple[float, bool, Optional[str]]:
+        text = " ".join(
+            str(market.get(k, "")).lower()
+            for k in (
+                "subtitle",
+                "yes_sub_title",
+                "yes_subtitle",
+                "title",
+                "yes_title",
+                "condition",
+                "rules_primary",
+                "rules_secondary",
+                "event_rulebook",
+                "settlement_window",
+            )
+        )
+        ambiguous_tokens = [
+            "sole discretion",
+            "discretion",
+            "final determination",
+            "subjective",
+            "opinion",
+            "editorial",
+            "judgment",
+            "manual review",
+        ]
+        clean_tokens = [
+            "cf benchmarks",
+            "price index",
+            "index",
+            "minute average",
+            "time-weighted",
+            "volume-weighted",
+        ]
+        score = 0.0
+        reasons = []
+        for token in ambiguous_tokens:
+            if token in text:
+                score += 1.0
+                reasons.append(token)
+        for token in clean_tokens:
+            if token in text:
+                score -= 0.5
+        blocked = score >= 1.0
+        reason = (", ".join(reasons[:3]) if reasons else None)
+        return max(0.0, score), blocked, reason
+
     async def _enqueue_snapshot(self, ticker: str, yes_bids, no_bids, ts_ms: int):
         event = OrderbookSnapshotEvent(
             exchange_ts=ts_ms,
@@ -346,6 +394,9 @@ class KalshiWSConsumer:
         strike_low: Optional[float] = None,
         strike_high: Optional[float] = None,
         settlement_window: Optional[str] = None,
+        oracle_risk_score: Optional[float] = None,
+        oracle_blocked: Optional[bool] = None,
+        oracle_reason: Optional[str] = None,
     ):
         event = MarketMetadataEvent(
             exchange_ts=ts_ms,
@@ -357,6 +408,9 @@ class KalshiWSConsumer:
             strike_low=strike_low,
             strike_high=strike_high,
             settlement_window=settlement_window,
+            oracle_risk_score=oracle_risk_score,
+            oracle_blocked=oracle_blocked,
+            oracle_reason=oracle_reason,
         )
         await self.event_queue.put(event)
 
@@ -411,6 +465,7 @@ class KalshiWSConsumer:
             ts_ms = self._parse_exchange_ts_ms(market.get("updated_time"), ingest_ts)
             direction, strike_low, strike_high = self._parse_contract_spec(ticker=ticker, market=market)
             settlement_window = self._parse_settlement_window(market)
+            oracle_risk_score, oracle_blocked, oracle_reason = self._parse_oracle_risk(market)
             await self._enqueue_market_meta(
                 ticker=ticker,
                 close_ts=close_ts,
@@ -420,6 +475,9 @@ class KalshiWSConsumer:
                 strike_low=strike_low,
                 strike_high=strike_high,
                 settlement_window=settlement_window,
+                oracle_risk_score=oracle_risk_score,
+                oracle_blocked=oracle_blocked,
+                oracle_reason=oracle_reason,
             )
             return True
         except Exception as e:
@@ -441,6 +499,9 @@ class KalshiWSConsumer:
             strike_low=strike_low,
             strike_high=strike_high,
             settlement_window=None,
+            oracle_risk_score=0.0,
+            oracle_blocked=False,
+            oracle_reason=None,
         )
         logging.warning("Seeded synthetic snapshot for %s", ticker)
 
@@ -735,6 +796,7 @@ class KalshiWSConsumer:
             if close_ts > 0:
                 direction, strike_low, strike_high = self._parse_contract_spec(ticker=ticker, market=payload)
                 settlement_window = self._parse_settlement_window(payload)
+                oracle_risk_score, oracle_blocked, oracle_reason = self._parse_oracle_risk(payload)
                 await self._enqueue_market_meta(
                     ticker=ticker,
                     close_ts=close_ts,
@@ -744,4 +806,7 @@ class KalshiWSConsumer:
                     strike_low=strike_low,
                     strike_high=strike_high,
                     settlement_window=settlement_window,
+                    oracle_risk_score=oracle_risk_score,
+                    oracle_blocked=oracle_blocked,
+                    oracle_reason=oracle_reason,
                 )

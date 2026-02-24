@@ -54,6 +54,9 @@ class MarketMetadataEvent:
     strike_low: Optional[float] = None
     strike_high: Optional[float] = None
     settlement_window: Optional[str] = None
+    oracle_risk_score: Optional[float] = None
+    oracle_blocked: Optional[bool] = None
+    oracle_reason: Optional[str] = None
 
 @dataclass
 class PaperFillEvent:
@@ -93,3 +96,22 @@ class QuoteAuditEvent:
     no_bid_cents: int
     half_spread_cents: int
     fee_widen_steps: int
+
+
+@dataclass
+class EdgeMetricEvent:
+    exchange_ts: int
+    ingest_ts: int
+    ticker: str
+    side: str
+    horizon_s: int
+    fill_ts: int
+    fill_size: int
+    fill_yes_price: float
+    mid_yes_after: float
+    signed_markout_cents: float
+    maker_fee_cents_per_contract: float
+    slippage_buffer_cents: float
+    fee_adjusted_edge_cents: float
+    sigma_at_quote: Optional[float] = None
+    tte_ms_at_quote: Optional[int] = None

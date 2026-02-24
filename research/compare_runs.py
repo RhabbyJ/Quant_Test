@@ -138,6 +138,7 @@ def compare_replay_runs(base: RunArtifacts, cand: RunArtifacts) -> dict[str, pd.
         tmp["horizon_s"] = pd.to_numeric(tmp["horizon_s"], errors="coerce")
         tmp["markout_cents"] = pd.to_numeric(tmp.get("markout_cents"), errors="coerce")
         tmp["markout_usd"] = pd.to_numeric(tmp.get("markout_usd"), errors="coerce")
+        tmp["fee_adjusted_edge_cents"] = pd.to_numeric(tmp.get("fee_adjusted_edge_cents"), errors="coerce")
         tmp = tmp.dropna(subset=["horizon_s"])
         if tmp.empty:
             return pd.DataFrame()
@@ -147,6 +148,7 @@ def compare_replay_runs(base: RunArtifacts, cand: RunArtifacts) -> dict[str, pd.
                 samples=("horizon_s", "count"),
                 avg_markout_cents=("markout_cents", "mean"),
                 total_markout_usd=("markout_usd", "sum"),
+                avg_fee_adjusted_edge_cents=("fee_adjusted_edge_cents", "mean"),
             )
             .sort_values("horizon_s")
         )
@@ -197,6 +199,9 @@ def _choose_score_metric(df: pd.DataFrame, requested: str = "", excluded: Option
     if requested and requested in df.columns:
         return requested
     for key in (
+        "edge_per_hour_usd",
+        "edge_per_hour_cents",
+        "fee_adjusted_edge_10s_avg_cents",
         "markout_10s_total_usd",
         "markout_10s_avg_cents",
         "markout_1s_total_usd",
